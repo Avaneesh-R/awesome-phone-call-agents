@@ -1620,17 +1620,20 @@ async function discoverVendors(){
 
 async function startCalling(){
   if(!_wizCampaignId) return;
+  // The consent checkbox above is the human approval; /approve records it
+  // before dispatching. Never bypass it — /start refuses unapproved campaigns.
+  if(!document.getElementById('wiz-consent').checked) return;
   document.getElementById('wiz-start-btn').disabled = true;
   document.getElementById('wiz-start-btn').textContent = 'Launching…';
 
   try {
-    const res = await fetch(`/api/campaigns/${_wizCampaignId}/start`, {
+    const res = await fetch(`/api/campaign/${_wizCampaignId}/approve`, {
       method: 'POST',
       headers: {'Content-Type':'application/json'},
       body: JSON.stringify({language: _wizLanguage, region: 'IN'})
     });
     const data = await res.json();
-    if(data.started){
+    if(data.ok){
       document.getElementById('wiz-start-btn').textContent = '✓ Pipeline Running';
       document.getElementById('calling-status').classList.add('on');
       switchTab('live');
