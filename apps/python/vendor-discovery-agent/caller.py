@@ -159,6 +159,23 @@ def _call_groq(client, **kwargs):
     return client.chat.completions.create(**kwargs)
 
 
+_RUN_ID_IN_TEXT_RE = re.compile(r"\brun_id\b[\"'\s:=]+([A-Za-z0-9_-]+)")
+
+
+def _run_id_from_content(result) -> str:
+    """Last-resort run_id scrape from the MCP content blocks, mirroring the CLI's
+    own extractRunId() fallback for responses that carry no structured run_id."""
+    if not isinstance(result, dict):
+        return ""
+    blocks = result.get("content")
+    if not isinstance(blocks, list):
+        return ""
+    text = "\n".join(b.get("text", "") for b in blocks
+                     if isinstance(b, dict) and isinstance(b.get("text"), str))
+    m = _RUN_ID_IN_TEXT_RE.search(text)
+    return m.group(1) if m else ""
+
+
 _TIMEOUT_RETRY_BUDGET = 2  # extra attempts if the backend itself times out
 
 def _run(args: list[str]) -> dict:
@@ -193,8 +210,25 @@ def _run(args: list[str]) -> dict:
         snippet = result.stdout[-300:] if result.stdout else "(empty)"
         raise RuntimeError(f"calle JSON parse error: {e}\nStdout tail: {snippet}") from e
     # CLI wraps everything in {ok, result: {structuredContent, content, isError}}
-    # Return structuredContent directly so callers get the flat schema
-    return outer.get("result", {}).get("structuredContent") or outer
+    # Return structuredContent directly so callers get the flat schema.
+    #
+    # Exception that used to break every real call: `calle call run` puts the
+    # run_id on the OUTER envelope and sets `result` to the *get_call_run status*
+    # payload, which carries no run_id of its own:
+    #     {ok, tool_name: "run_call", result: <statusResult>, run_id, run_result}
+    # Unwrapping blindly to structuredContent threw the envelope away, so the id
+    # was lost and execute_call_pipeline raised "run_call did not return run_id"
+    # on every call -- after the vendor had already been dialed. Carry the
+    # envelope's run_id across the unwrap, with the same content-text fallback
+    # the CLI itself uses.
+    inner = outer.get("result")
+    structured = inner.get("structuredContent") if isinstance(inner, dict) else None
+    payload = structured if isinstance(structured, dict) and structured else outer
+    if isinstance(payload, dict) and not payload.get("run_id"):
+        run_id = outer.get("run_id") or _run_id_from_content(inner)
+        if run_id:
+            payload = {**payload, "run_id": run_id}
+    return payload
 
 
 def plan_call(phone: str, goal: str, region: str = None, language: str = None) -> dict:

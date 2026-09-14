@@ -2643,20 +2643,50 @@ def api_discover():
 
         result_vendors = []
         if _db_fallback:
-            # Vendors are already in DB — just score and return as preview (no re-insert)
-            for v in vendors:
-                try:
-                    score, _ = score_lead(v)
-                except Exception:
-                    score = 5
-                result_vendors.append({
-                    "id":           None,
-                    "name":         v.get("name") or "Unknown",
-                    "category":     v.get("category") or "",
-                    "address":      v.get("address") or "",
-                    "masked_phone": _mask_phone(v["phone"]),
-                    "score":        score,
-                })
+            # Vendors are recycled from an earlier campaign's leads (Overpass was
+            # down/rate-limited), but they still have to become real leads under
+            # THIS campaign_id — otherwise the preview shows vendors that were
+            # never inserted here, /approve finds 0 not_called leads for the new
+            # campaign, and "Start Calling" fails every time with no way to
+            # recover. The phone-based dedup used in the live-discovery branch
+            # below is deliberately skipped here: these rows are being reused
+            # *because* they already exist for another campaign, so that same
+            # check would always skip them.
+            with get_conn() as conn:
+                for v in vendors:
+                    if _looks_spam(v["phone"]):
+                        continue
+                    try:
+                        score, reasons = score_lead(v)
+                    except Exception:
+                        score, reasons = 5, []
+
+                    lead = Lead(
+                        phone=v["phone"],
+                        campaign_id=campaign_id,
+                        name=v.get("name"),
+                        category=v.get("category"),
+                        lat=v.get("lat"),
+                        lon=v.get("lon"),
+                        osm_id=v.get("osm_id"),
+                        candidate_id=f"osm:{v['osm_id']}" if v.get("osm_id") else None,
+                        address=v.get("address"),
+                    )
+                    lead.save(conn)
+                    conn.execute(
+                        "UPDATE leads SET lead_score=?, score_reasons=? WHERE id=?",
+                        (score, json.dumps(reasons), lead.id)
+                    )
+                    conn.commit()
+
+                    result_vendors.append({
+                        "id":           lead.id,
+                        "name":         v.get("name") or "Unknown",
+                        "category":     v.get("category") or "",
+                        "address":      v.get("address") or "",
+                        "masked_phone": _mask_phone(v["phone"]),
+                        "score":        score,
+                    })
         else:
             with get_conn() as conn:
                 for v in vendors:
