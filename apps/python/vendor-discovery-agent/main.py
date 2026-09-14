@@ -416,6 +416,11 @@ def run_campaign(product: str, location: str, limit: int,
             print(f"  Error: {e}")
             with get_conn() as conn:
                 update_lead_status(conn, lead.id, "failed", None, round_num=1)
+                # Keep the reason with the lead — a bare "failed" badge with no
+                # explanation is the one outcome the dashboard cannot account for.
+                conn.execute("UPDATE leads SET skip_reason=? WHERE id=?",
+                             (f"call error: {e}"[:400], lead.id))
+                conn.commit()
 
     if not positives:
         print("\nNo positive responses from round 1.")

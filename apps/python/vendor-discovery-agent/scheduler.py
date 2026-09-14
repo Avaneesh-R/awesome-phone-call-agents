@@ -249,7 +249,10 @@ def _fire(row) -> None:
     campaign_id = row["campaign_id"]
     tz_name     = row["timezone"] or "UTC"
     region      = row["region"]
-    language    = row["language"]
+    # Rows queued before scheduled_calls gained a language column (or by any path
+    # that didn't set one) carry NULL here, which makes plan_call drop --language
+    # and hit CALL-E's ambiguous-language dead-end. Same default as main.py's CLI arg.
+    language    = row["language"] or "English"
     masked      = row["masked_phone"] or _mask_phone(phone)
     try:
         round_num = row["round"]
@@ -275,6 +278,15 @@ def _fire(row) -> None:
         )
         if status_output.get("status") == "SKIPPED":
             _update_status(sched_id, "skipped")
+            # Also record why on the lead itself — the scheduled_calls row is not
+            # surfaced in the dashboard, so without this the lead just stops moving
+            # with no visible explanation.
+            reason = status_output.get("skip_reason")
+            if reason and lead_id:
+                with get_conn() as conn:
+                    conn.execute("UPDATE leads SET status='skipped', skip_reason=? WHERE id=?",
+                                 (str(reason)[:400], lead_id))
+                    conn.commit()
             return
 
         call_id   = status_output.get("run_id") or status_output.get("id") or "unknown"
@@ -313,7 +325,7 @@ def _fire(row) -> None:
                 )
                 print(f"  [Scheduler] R1 retry positive for lead {lead_id} — R2 scheduled.")
 
-            elif outcome in ("no_answer", "busy", "failed"):
+            elif outcome in ("no_answer", "busy", "failed", "cancelled"):
                 retry_count = _get_retry_count(lead_id)
                 scheduled = schedule_retry(
                     lead_id=lead_id, campaign_id=campaign_id, product=product,

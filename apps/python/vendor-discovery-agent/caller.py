@@ -39,19 +39,59 @@ POLL_INTERVAL = 15
 MAX_POLLS = 40  # 10 minutes max per call
 
 
-# Live event streaming registry (run_id -> Queue)
+# Live event streaming registry (live_id -> Queue)
+#
+# The live channel is keyed on a *live_id* minted before dialing, not on CALL-E's
+# run_id: run_id only exists after plan_call + run_call return (15-40s), and the
+# Live tab has to show "we are calling X" during that window rather than a blank
+# console. poll_until_done() therefore takes an explicit live_id.
 _live_lock = _threading.Lock()
 _LIVE_QUEUES: dict = {}
+_LIVE_ORDER: list = []      # registration order, oldest first
+_LIVE_BACKLOG: dict = {}    # live_id -> last few events, replayed to a late consumer
+_live_seq = 0
+_LIVE_BACKLOG_MAX = 40
 
 def register_live_queue(run_id: str) -> _queue.Queue:
-    q = _queue.Queue(maxsize=100)
+    """Idempotent: a consumer attaching to a live run reuses the producer's queue
+    instead of silently replacing it (which used to drop every event published
+    between the producer registering and the browser connecting)."""
     with _live_lock:
-        _LIVE_QUEUES[run_id] = q
+        q = _LIVE_QUEUES.get(run_id)
+        if q is None:
+            q = _queue.Queue(maxsize=500)
+            _LIVE_QUEUES[run_id] = q
+            _LIVE_ORDER.append(run_id)
     return q
+
+def attach_live_queue(run_id: str):
+    """Consumer-side attach: returns (queue, backlog) for a run that is still live,
+    or (None, []) if it has already finished. Never creates a new entry, so a late
+    SSE connection can't resurrect a finished run as a zombie in active_live_runs()."""
+    with _live_lock:
+        q = _LIVE_QUEUES.get(run_id)
+        if q is None:
+            return None, []
+        # Everything already queued is also in the backlog (_publish_live records it
+        # first), so drain the queue before handing the backlog over — otherwise the
+        # consumer replays the history and then receives the same events again.
+        while True:
+            try:
+                q.get_nowait()
+            except _queue.Empty:
+                break
+        return q, list(_LIVE_BACKLOG.get(run_id) or [])
+
+def live_backlog(run_id: str) -> list:
+    with _live_lock:
+        return list(_LIVE_BACKLOG.get(run_id) or [])
 
 def _publish_live(run_id: str, event: dict) -> None:
     with _live_lock:
         q = _LIVE_QUEUES.get(run_id)
+        backlog = _LIVE_BACKLOG.setdefault(run_id, [])
+        backlog.append(event)
+        del backlog[:-_LIVE_BACKLOG_MAX]
     if q:
         try:
             q.put_nowait(event)
@@ -61,10 +101,58 @@ def _publish_live(run_id: str, event: dict) -> None:
 def unregister_live_queue(run_id: str) -> None:
     with _live_lock:
         _LIVE_QUEUES.pop(run_id, None)
+        _LIVE_BACKLOG.pop(run_id, None)
+        try:
+            _LIVE_ORDER.remove(run_id)
+        except ValueError:
+            pass
 
 def active_live_runs() -> list:
+    """Newest first — the dashboard opens runs[0], and in a sequential campaign the
+    interesting run is always the one that just started, not the oldest still-open one."""
     with _live_lock:
-        return list(_LIVE_QUEUES.keys())
+        return [r for r in reversed(_LIVE_ORDER) if r in _LIVE_QUEUES]
+
+def _next_live_id() -> str:
+    global _live_seq
+    with _live_lock:
+        _live_seq += 1
+        return f"live-{int(time.time())}-{_live_seq}"
+
+# campaign_id -> total leads queued when the campaign's first call was dialed,
+# so the console can say "(2 of 5)" for a sequential run.
+_LIVE_CAMPAIGN_TOTALS: dict = {}
+
+def _live_lead_context(phone: str, campaign_id) -> tuple:
+    """(label, index, total) for the lead about to be dialed. Best-effort only —
+    never let live-console cosmetics break a call."""
+    label, index, total = None, None, None
+    try:
+        from models import get_conn, _mask_phone
+        label = _mask_phone(phone)
+        if campaign_id is None:
+            return label, None, None
+        with get_conn() as conn:
+            row = conn.execute(
+                "SELECT name FROM leads WHERE campaign_id=? AND phone=? LIMIT 1",
+                (campaign_id, phone)
+            ).fetchone()
+            if row and row["name"]:
+                label = row["name"]
+            remaining = conn.execute(
+                "SELECT COUNT(*) AS c FROM leads WHERE campaign_id=? AND status='not_called'",
+                (campaign_id,)
+            ).fetchone()["c"]
+        remaining = max(int(remaining or 0), 1)  # this lead is still 'not_called'
+        prev_total = _LIVE_CAMPAIGN_TOTALS.get(campaign_id)
+        if prev_total is None or remaining > prev_total:
+            prev_total = remaining          # first lead of this campaign run
+            _LIVE_CAMPAIGN_TOTALS[campaign_id] = prev_total
+        total = prev_total
+        index = total - remaining + 1
+    except Exception:
+        pass
+    return label, index, total
 
 
 def _call_groq(client, **kwargs):
@@ -122,12 +210,70 @@ def run_call(plan_id: str, confirm_token: str) -> dict:
     return _run(["call", "run", "--plan-id", plan_id, "--confirm-token", confirm_token])
 
 
+# CALL-E currently dials US / India / Singapore / Australia only. For anywhere else
+# plan_call answers with clarifying_questions and no confirm_token — that is a real,
+# explainable answer, not a crash, so its text has to reach the dashboard verbatim
+# instead of being dumped into a RuntimeError message.
+_REJECTION_KEYS = ("message", "reason", "error", "summary", "detail", "status_reason")
+_UNSUPPORTED_REGION_RE = re.compile(
+    r"region|country|unsupported|not supported|not available|coverage", re.I)
+
+
+def plan_rejection_reason(plan: dict) -> str:
+    """Human-readable text explaining why a plan came back without a confirm token."""
+    questions = plan.get("clarifying_questions") or []
+    if isinstance(questions, str):
+        questions = [questions]
+    if isinstance(questions, list) and questions:
+        parts = []
+        for q in questions:
+            if isinstance(q, dict):
+                q = q.get("question") or q.get("text") or q.get("prompt") or json.dumps(q)
+            text = str(q).strip()
+            if text:
+                parts.append(text)
+        if parts:
+            return " ".join(parts)[:400]
+    for key in _REJECTION_KEYS:
+        val = plan.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()[:400]
+    return ""
+
+
+def describe_plan_rejection(plan: dict) -> str:
+    """Turn a non-dialable plan response into a short skip_reason a human can read."""
+    reason = plan_rejection_reason(plan)
+    if reason and _UNSUPPORTED_REGION_RE.search(reason):
+        return f"region not supported: {reason}"
+    if reason:
+        return f"call not planned: {reason}"
+    return f"call not planned: CALL-E returned no confirm token ({json.dumps(plan)[:200]})"
+
+
 TERMINAL_STATUSES = {"COMPLETED","FAILED","NO_ANSWER","NO ANSWER","BUSY","CANCELLED","DECLINED",
                      "completed","failed","no_answer","no answer","busy","cancelled","declined"}
 
+# The live console prints a "DONE — <status>" line verbatim, so the terminal status
+# published there has to read like a sentence, not like an enum member.
+_TERMINAL_LABELS = {
+    "COMPLETED": "COMPLETED — call ended",
+    "NO_ANSWER": "NO ANSWER — nobody picked up",
+    "BUSY":      "BUSY — line was busy",
+    "DECLINED":  "DECLINED — call rejected",
+    "CANCELLED": "CANCELLED — call cancelled",
+    "FAILED":    "FAILED — call could not complete",
+}
+
+def terminal_label(raw_status: str) -> str:
+    key = (raw_status or "").upper().replace(" ", "_")
+    return _TERMINAL_LABELS.get(key, raw_status or "finished")
+
 _FETCH_RETRY_BUDGET = 3  # transient fetch-failed retries per poll cycle
 
-def poll_until_done(run_id: str, on_update=None) -> dict:
+def poll_until_done(run_id: str, on_update=None, live_id: str = None, live_meta: dict = None) -> dict:
+    live_id = live_id or run_id
+    live_meta = live_meta or {}
     fetch_fails = 0
     for _ in range(MAX_POLLS):
         try:
@@ -140,41 +286,54 @@ def poll_until_done(run_id: str, on_update=None) -> dict:
                 time.sleep(POLL_INTERVAL)
                 continue
             raise  # exhaust budget or non-transient error
-        _publish_live(run_id, {
+        _publish_live(live_id, {
             "type": "status",
             "status": status.get("status", ""),
             "transcript": parse_transcript_to_json(status),
             "summary": (status.get("result") or {}).get("summary", ""),
+            **live_meta,
         })
         if on_update:
             on_update(status)
         raw = status.get("status", "")
         if raw in TERMINAL_STATUSES or raw.upper().replace(" ", "_") in TERMINAL_STATUSES:
-            _publish_live(run_id, {"type": "done", "status": status.get("status", "")})
+            _publish_live(live_id, {"type": "done", "status": terminal_label(status.get("status", "")), **live_meta})
             return status
         time.sleep(POLL_INTERVAL)
     final_status = _run(["call", "status", "--run-id", run_id])
-    _publish_live(run_id, {
+    _publish_live(live_id, {
         "type": "status",
         "status": final_status.get("status", ""),
         "transcript": parse_transcript_to_json(final_status),
         "summary": (final_status.get("result") or {}).get("summary", ""),
+        **live_meta,
     })
     if on_update:
         on_update(final_status)
-    _publish_live(run_id, {"type": "done", "status": final_status.get("status", "")})
+    _publish_live(live_id, {"type": "done", "status": terminal_label(final_status.get("status", "")), **live_meta})
     return final_status
 
 
 def classify_round1(status_output: dict) -> str:
     """
-    Returns one of: positive | negative | no_answer | failed
+    Returns one of: positive | negative | no_answer | busy | declined |
+                    failed | cancelled | unknown
     Uses CALL-E's own outcome/status field as primary signal,
     then falls back to transcript keyword scan if available.
+
+    BUSY / DECLINED / CANCELLED used to collapse into no_answer|failed, which made the
+    dashboard say "no answer" for a vendor who actively rejected the call. Each real
+    CALL-E terminal status now keeps its own name so the UI can state what happened.
     """
     call_status = status_output.get("status", "").upper().replace(" ", "_")
-    if call_status in ("NO_ANSWER", "BUSY", "DECLINED"):
+    if call_status == "NO_ANSWER":
         return "no_answer"
+    if call_status == "BUSY":
+        return "busy"
+    if call_status == "DECLINED":
+        return "declined"
+    if call_status == "CANCELLED":
+        return "cancelled"
     if call_status == "FAILED":
         return "failed"
 
@@ -365,31 +524,67 @@ def execute_call_pipeline(phone: str, goal: str, region: str = None, language: s
         print(f"  Skipping — outside business hours.")
         return {"status": "SKIPPED", "skip_reason": "outside_business_hours", "tz_info": reason}
 
-    print(f"\n  Planning call to {_mask_phone(phone)}...")
-    plan = plan_call(phone, goal, region, language)
+    # Live console: open the channel BEFORE dialing, so the Live tab lights up on
+    # the first poll after the user clicks Start rather than staying blank for the
+    # 15-40s that plan_call + run_call take. The try/finally below also guarantees
+    # the channel is torn down on failure — a leaked entry used to leave the
+    # dashboard subscribed to a dead run for the rest of the campaign.
+    live_label, live_index, live_total = _live_lead_context(phone, campaign_id)
+    live_meta = {"lead": live_label, "index": live_index, "total": live_total}
+    live_id = _next_live_id()
+    register_live_queue(live_id)
+    _progress = f" ({live_index} of {live_total})" if live_index and live_total else ""
+    try:
+        _publish_live(live_id, {"type": "status", "status": "PLANNING",
+                                "summary": f"Preparing call to {live_label}{_progress}…",
+                                **live_meta})
+        print(f"\n  Planning call to {_mask_phone(phone)}...")
+        plan = plan_call(phone, goal, region, language)
 
-    plan_id = plan.get("plan_id")
-    confirm_token = plan.get("confirm_token")
+        plan_id = plan.get("plan_id")
+        confirm_token = plan.get("confirm_token")
 
-    if not plan_id or not confirm_token:
-        raise RuntimeError(f"plan_call did not return plan_id/confirm_token: {plan}")
+        if not plan_id or not confirm_token:
+            # Not an error — CALL-E declined to dial (unsupported region is the common
+            # case) and told us why. Return it as a SKIPPED outcome so every caller's
+            # existing skip handling records the reason on the lead, instead of raising
+            # and leaving the dashboard with a bare "failed" badge and a traceback.
+            skip_reason = describe_plan_rejection(plan)
+            print(f"  Not dialable — {skip_reason}")
+            _publish_live(live_id, {"type": "done",
+                                    "status": "NOT DIALED — " + skip_reason[:140],
+                                    "summary": skip_reason[:200], **live_meta})
+            return {"status": "SKIPPED", "skip_reason": skip_reason, "plan": plan}
 
-    print(f"  Plan ID: {plan_id}")
+        print(f"  Plan ID: {plan_id}")
 
-    if dry_run:
-        print("  [DRY RUN] Skipping execution.")
-        return {"status": "dry_run", "plan": plan}
+        if dry_run:
+            print("  [DRY RUN] Skipping execution.")
+            _publish_live(live_id, {"type": "done", "status": "dry_run", **live_meta})
+            return {"status": "dry_run", "plan": plan}
 
-    print("  Executing call...")
-    run_result = run_call(plan_id, confirm_token)
-    run_id = run_result.get("run_id") or run_result.get("id")
-    if not run_id:
-        raise RuntimeError(f"run_call did not return run_id: {run_result}")
+        print("  Executing call...")
+        _publish_live(live_id, {"type": "status", "status": "DIALING",
+                                "summary": f"Dialing {live_label}{_progress}…",
+                                **live_meta})
+        run_result = run_call(plan_id, confirm_token)
+        run_id = run_result.get("run_id") or run_result.get("id")
+        if not run_id:
+            raise RuntimeError(f"run_call did not return run_id: {run_result}")
 
-    print(f"  Run ID: {run_id} — polling for completion...")
-    register_live_queue(run_id)
-    final_status = poll_until_done(run_id)
-    unregister_live_queue(run_id)
+        print(f"  Run ID: {run_id} — polling for completion...")
+        final_status = poll_until_done(run_id, live_id=live_id, live_meta=live_meta)
+    except Exception as e:
+        # Surface the failure in the console instead of letting the live indicator
+        # spin forever on a run that will never publish another event.
+        _publish_live(live_id, {"type": "done",
+                                "status": "FAILED — " + str(e)[:140],
+                                "summary": str(e)[:200], **live_meta})
+        raise
+    finally:
+        # The SSE generator holds its own reference to the queue, so any events
+        # already published are still delivered after this de-registration.
+        unregister_live_queue(live_id)
     raw_status = (final_status.get("status") or "").upper().replace(" ", "_")
     print(f"  Done. Status: {raw_status}")
 

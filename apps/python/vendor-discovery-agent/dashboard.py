@@ -265,6 +265,10 @@ pre.json-view{font-family:monospace;font-size:.76rem;color:#c9d1d9;white-space:p
 /* Address */
 .address-tag{font-size:.72rem;color:#8b949e;font-style:italic;padding:2px 0}
 
+/* Reason line under a skipped/failed status badge */
+.skip-tag{font-size:.64rem;color:#8b949e;font-style:italic;margin-top:3px;max-width:180px;
+          overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
 /* Scheduled tag on lead row */
 .sched-tag{font-size:.68rem;background:#162016;color:#56d364;border:1px solid #2a4a2a;border-radius:8px;padding:1px 7px;white-space:nowrap}
 
@@ -278,6 +282,7 @@ pre.json-view{font-family:monospace;font-size:.76rem;color:#c9d1d9;white-space:p
 .s-failed{background:#3a1a1a;color:#f85149}
 .s-skipped{background:#21262d;color:#666}
 .s-positive_r2{background:#1a2a3a;color:#58a6ff}
+.s-unknown{background:#2a1f3a;color:#bc8cff}
 
 /* Chevron */
 .chev{color:#444;font-size:.9rem;transition:transform .2s;display:inline-block;margin-right:4px}
@@ -336,6 +341,9 @@ pre.json-view{font-family:monospace;font-size:.76rem;color:#c9d1d9;white-space:p
 .live-status{color:#22c55e;font-weight:600;min-width:80px}
 .live-text{color:#c7ccd6;flex:1}
 .live-empty{color:#565d6e;font-style:italic;font-size:.75rem;padding:8px 0}
+.live-done{border-top:1px solid rgba(255,255,255,.10);margin-top:4px;padding-top:6px}
+.live-done .live-status{color:#e9c46a}
+.live-done .live-text{color:#e9c46a}
 .live-dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--success);animation:pulse 1.2s infinite}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
 
@@ -522,6 +530,7 @@ tbody tr.lead-row:last-of-type td{border-bottom:none}
 .s-failed{background:rgba(248,81,73,.12);color:#ff6b64;border-color:rgba(248,81,73,.3)}
 .s-skipped{background:rgba(139,146,166,.08);color:#767d8f;border-color:rgba(139,146,166,.18)}
 .s-positive_r2{background:rgba(139,92,246,.14);color:#b79bff;border-color:rgba(139,92,246,.3)}
+.s-unknown{background:rgba(188,140,255,.12);color:#bc8cff;border-color:rgba(188,140,255,.28)}
 .chev{color:#565d6e;font-size:.9rem;transition:transform .22s cubic-bezier(.34,1.4,.5,1),color .2s;display:inline-block;margin-right:6px}
 tr.lead-row:hover .chev{color:#7aa7ff}
 .chev.open{transform:rotate(90deg);color:#7aa7ff}
@@ -848,8 +857,42 @@ tbody tr.lead-row:hover{background:linear-gradient(90deg,rgba(99,102,241,.08),rg
 const SC = {
   positive:'s-positive', negative:'s-negative', no_answer:'s-no_answer',
   completed:'s-completed', not_called:'s-not_called', failed:'s-failed',
-  skipped:'s-skipped', positive_r2:'s-positive_r2'
+  skipped:'s-skipped', positive_r2:'s-positive_r2',
+  // Outcomes that used to collapse into no_answer/failed, plus 'unknown'
+  busy:'s-no_answer', declined:'s-negative', cancelled:'s-failed',
+  exhausted:'s-skipped', unknown:'s-unknown'
 };
+
+// Human-readable badge text — raw snake_case statuses read like DB rows
+const SLABEL = {
+  no_answer:'no answer', not_called:'not called', positive_r2:'positive · R2',
+  exhausted:'retries exhausted', unknown:'unclear'
+};
+function statusLabel(s){ return s ? (SLABEL[s] || String(s).replace(/_/g,' ')) : 'not called'; }
+
+// Why there is no transcript, per real outcome — an empty list alone is ambiguous
+const NO_TRANSCRIPT_MSG = {
+  no_answer:'Call not answered — no transcript.',
+  busy:     'Line was busy — no transcript.',
+  declined: 'Call declined — no transcript.',
+  failed:   'Call failed — no transcript.',
+  cancelled:'Call cancelled — no transcript.',
+  skipped:  'Call not placed — no transcript.',
+  exhausted:'Retries exhausted — never answered.',
+  not_called:'Not called yet.'
+};
+// Machine skip_reason tokens the backend writes, in plain English
+const REASON_LABEL = {
+  outside_business_hours:'outside vendor business hours',
+  no_consent_on_record: 'campaign not approved for calling'
+};
+function prettyReason(r){ return r ? (REASON_LABEL[r] || String(r)) : ''; }
+
+function noTranscriptMsg(status, skipReason){
+  const base = NO_TRANSCRIPT_MSG[status] || 'No transcript available';
+  const r = prettyReason(skipReason);
+  return r ? base + ' (' + r + ')' : base;
+}
 
 let _lastData = [];
 let _activeTab = 'leads';
@@ -893,10 +936,16 @@ const CHART_TXT = '#c9d1d9', CHART_GRID = '#30363d';
 
 function renderAnalytics(data){
   // Outcomes donut
-  const outColors = {positive:'#56d364',negative:'#f85149',no_answer:'#e3b341',completed:'#58a6ff',failed:'#f85149',skipped:'#666'};
-  const outKeys = ['positive','negative','no_answer','completed','failed','skipped'];
+  const outColors = {positive:'#56d364',negative:'#f85149',declined:'#f85149',no_answer:'#e3b341',
+                     busy:'#e3b341',completed:'#58a6ff',failed:'#f85149',cancelled:'#666',
+                     skipped:'#666',unknown:'#bc8cff'};
+  const outKeys = ['positive','negative','declined','no_answer','busy','completed','failed','cancelled','skipped','unknown'];
   const outCounts = Object.fromEntries(outKeys.map(k=>[k,0]));
   data.forEach(c=>c.leads.forEach(l=>{ if(l.status in outCounts) outCounts[l.status]++; }));
+  // Only chart outcomes that actually occurred — the key list is wider now that
+  // busy/declined/cancelled/unknown are distinct, and empty slices clutter the legend.
+  let outShown = outKeys.filter(k=>outCounts[k]>0);
+  if(!outShown.length) outShown = ['positive','negative','no_answer'];
 
   // Interest bar
   const intKeys = ['high','medium','low','none','unknown'];
@@ -925,7 +974,7 @@ function renderAnalytics(data){
   _charts['outcomes']?.destroy();
   _charts['outcomes'] = new Chart(document.getElementById('chart-outcomes'),{
     type:'doughnut',
-    data:{labels:outKeys,datasets:[{data:outKeys.map(k=>outCounts[k]),backgroundColor:outKeys.map(k=>outColors[k]),borderColor:'#161b22'}]},
+    data:{labels:outShown.map(statusLabel),datasets:[{data:outShown.map(k=>outCounts[k]||0),backgroundColor:outShown.map(k=>outColors[k]),borderColor:'#161b22'}]},
     options:{responsive:true,maintainAspectRatio:false,plugins:{legend:legendTop}}
   });
 
@@ -982,15 +1031,19 @@ const MAP_COLOR = {
   completed:'#58a6ff',
   no_answer:'#e3b341',
   busy:     '#e3b341',
+  exhausted:'#e3b341',
+  declined: '#f85149',
   failed:   '#666',
+  cancelled:'#666',
   skipped:  '#555',
 };
 
 // Bucket a lead's status into the filter categories
 function mapFilterBucket(status){
   if(status==='positive') return 'positive';
-  if(status==='negative') return 'negative';
-  if(status==='no_answer' || status==='busy' || status==='failed') return 'no_answer';
+  if(status==='negative' || status==='declined') return 'negative';
+  if(status==='no_answer' || status==='busy' || status==='failed'
+     || status==='cancelled' || status==='exhausted') return 'no_answer';
   if(status==='not_called' || status==='skipped' || !status) return 'not_called';
   return 'other'; // completed / unknown -> answered but uncategorised
 }
@@ -1108,8 +1161,8 @@ function renderMap(data){
 
     // Build popup — Inter font, design-system colours
     const statusBadge = wasAnswered
-      ? `<span style="display:inline-block;padding:2px 9px;border-radius:20px;font-size:.66rem;font-weight:600;background:${col}22;color:${col};border:1px solid ${col}55">${escHtml(l.r1_status)} · answered</span>`
-      : `<span style="display:inline-block;padding:2px 9px;border-radius:20px;font-size:.66rem;font-weight:600;background:rgba(139,146,166,.12);color:#9aa1b3;border:1px solid rgba(139,146,166,.25)">${escHtml(l.r1_status||'not called')}</span>`;
+      ? `<span style="display:inline-block;padding:2px 9px;border-radius:20px;font-size:.66rem;font-weight:600;background:${col}22;color:${col};border:1px solid ${col}55">${escHtml(statusLabel(l.r1_status))} · answered</span>`
+      : `<span style="display:inline-block;padding:2px 9px;border-radius:20px;font-size:.66rem;font-weight:600;background:rgba(139,146,166,.12);color:#9aa1b3;border:1px solid rgba(139,146,166,.25)">${escHtml(statusLabel(l.r1_status))}</span>`;
 
     let inferenceBlock = '';
     if(wasAnswered && l.r1_inference){
@@ -1128,6 +1181,10 @@ function renderMap(data){
         const snippet = userLines.slice(0,2).map(x=>x.text).join(' / ').slice(0,120);
         transcriptBlock = `<div style="margin-top:6px;padding:6px 9px;background:rgba(8,9,15,.6);border-left:3px solid ${col};font-size:.72rem;color:#c7ccd6;border-radius:6px">"${escHtml(snippet)}"</div>`;
       }
+    }
+    if(!transcriptBlock && !(wasAnswered && l.transcript && l.transcript.length)){
+      // Say why there is nothing to quote — an omitted block reads as a broken popup
+      transcriptBlock = `<div style="margin-top:6px;padding:6px 9px;background:rgba(8,9,15,.6);border-left:3px solid ${col};font-size:.72rem;color:#9aa1b3;border-radius:6px">${escHtml(noTranscriptMsg(l.r1_status, l.skip_reason))}</div>`;
     }
 
     const addressBlock = l.address
@@ -1164,7 +1221,7 @@ function renderMap(data){
 
   setTimeout(()=>_map.invalidateSize(), 420);
 }
-function badge(s){ return `<span class="status ${SC[s]||'s-not_called'}">${s||'?'}</span>`; }
+function badge(s){ return `<span class="status ${SC[s]||'s-unknown'}">${escHtml(statusLabel(s))}</span>`; }
 function trunc(s,n){ return s&&s.length>n?s.slice(0,n)+'...':s||''; }
 function escHtml(s){ return s?String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'):''; }
 
@@ -1181,8 +1238,9 @@ function _spark(color){
   </svg>`;
 }
 
-function renderTranscript(lines){
-  if(!lines||!lines.length) return '<span style="color:#555;font-size:.75rem">No transcript available</span>';
+function renderTranscript(lines, status, skipReason){
+  if(!lines||!lines.length)
+    return `<span style="color:#8b949e;font-size:.75rem">${escHtml(noTranscriptMsg(status, skipReason))}</span>`;
   return lines.map(l=>{
     const isBOT = l.speaker&&l.speaker.toUpperCase()==='BOT';
     return `<div class="transcript-line">
@@ -1210,50 +1268,107 @@ function closeModal(){
 document.addEventListener('keydown', e=>{ if(e.key==='Escape') closeModal(); });
 
 // ── Live console ──────────────────────────────────────────────
-let _liveSource = null;
-let _liveRunId  = null;
+let _liveSource   = null;
+let _liveRunId    = null;
+let _liveDoneIds  = {};   // run_ids already played out — never re-open these
+let _liveLastTx   = 0;    // how many transcript lines of this run are already printed
 
-function appendLiveLine(ts, statusText, text){
+function appendLiveLine(ts, statusText, text, cls){
   const c = document.getElementById('live-console');
+  if(!c) return;
   if(c.querySelector('.live-empty')) c.innerHTML='';
   const d = document.createElement('div');
-  d.className='live-line';
-  d.innerHTML=`<span class="live-ts">${escHtml(ts||'')}</span><span class="live-status">${escHtml(statusText)}</span><span class="live-text">${escHtml(text||'')}</span>`;
+  d.className='live-line'+(cls?' '+cls:'');
+  d.innerHTML=`<span class="live-ts">${escHtml(ts||'')}</span><span class="live-status">${escHtml(statusText||'')}</span><span class="live-text">${escHtml(text||'')}</span>`;
   c.appendChild(d);
   c.scrollTop=c.scrollHeight;
 }
 
+function _liveLeadLabel(ev){
+  let s = ev.lead || '';
+  if(ev.index && ev.total) s += (s?' ':'')+'('+ev.index+' of '+ev.total+')';
+  return s;
+}
+
+function setLiveIndicator(on){
+  const el = document.getElementById('live-indicator');
+  if(el) el.style.display = on ? 'inline' : 'none';
+}
+
+function closeLiveStream(){
+  if(_liveSource){ try{ _liveSource.close(); }catch(e){} }
+  _liveSource = null;
+  setLiveIndicator(false);
+}
+
 function openLiveStream(runId){
-  if(_liveSource){ _liveSource.close(); }
+  closeLiveStream();
   _liveRunId = runId;
-  _liveSource = new EventSource('/api/live/'+runId);
-  document.getElementById('live-indicator').style.display='inline';
-  _liveSource.onmessage = function(e){
-    const ev = JSON.parse(e.data);
+  _liveLastTx = 0;
+  let src;
+  try { src = new EventSource('/api/live/'+encodeURIComponent(runId)); }
+  catch(e){ _liveRunId = null; return; }
+  _liveSource = src;
+  setLiveIndicator(true);
+  src.onmessage = function(e){
+    if(src !== _liveSource) return;        // a newer stream already took over
+    let ev;
+    try { ev = JSON.parse(e.data); } catch(err){ return; }
+    const who = _liveLeadLabel(ev);
     if(ev.type==='status'){
-      appendLiveLine(new Date().toLocaleTimeString(), ev.status, ev.summary||'');
-      if(ev.transcript&&ev.transcript.length){
-        ev.transcript.forEach(l=>appendLiveLine(l.time, l.speaker, l.text));
+      const head = ev.summary || who || '';
+      appendLiveLine(new Date().toLocaleTimeString(), ev.status||'', head);
+      // Transcript arrives cumulatively on every poll — only print the new tail,
+      // otherwise the console repeats the whole conversation every 15s.
+      if(ev.transcript && ev.transcript.length){
+        for(let i=_liveLastTx; i<ev.transcript.length; i++){
+          const l = ev.transcript[i];
+          appendLiveLine(l.time, l.speaker, l.text);
+        }
+        _liveLastTx = Math.max(_liveLastTx, ev.transcript.length);
       }
     } else if(ev.type==='done'){
-      appendLiveLine('', 'DONE', ev.status||'');
-      document.getElementById('live-indicator').style.display='none';
-      _liveSource.close(); _liveSource=null;
+      _liveDoneIds[runId] = 1;
+      if(ev.status !== 'ENDED'){
+        appendLiveLine(new Date().toLocaleTimeString(), 'DONE',
+                       (who?who+' — ':'')+(ev.status||'finished'), 'live-done');
+      }
+      closeLiveStream();
+      _liveRunId = null;
+      pollLiveRuns();                       // pick up the next lead without waiting
     }
+  };
+  src.onerror = function(){
+    if(src !== _liveSource) return;
+    // EventSource retries on its own; a run that has really ended is dropped from
+    // /api/live-runs, so just release the slot and let the poller decide.
+    closeLiveStream();
+    _liveRunId = null;
   };
 }
 
+let _livePolling = false;
 async function pollLiveRuns(){
+  if(_livePolling) return;
+  _livePolling = true;
   try {
     const runs = await fetch('/api/live-runs').then(r=>r.json());
-    if(runs.length>0 && runs[0]!==_liveRunId){
-      openLiveStream(runs[0]);
-      // Auto-switch to Live tab if not already there
-      if(document.getElementById('live-view') && !document.getElementById('live-view').classList.contains('active')){
-        switchTab('live');
+    // Server returns newest-first. In a sequential campaign each lead mints a new
+    // run id, so always follow the newest one that we haven't already played out.
+    const next = (runs||[]).find(r => !_liveDoneIds[r]);
+    if(next){
+      if(next !== _liveRunId || !_liveSource){
+        openLiveStream(next);
+        if(document.getElementById('live-view') && !document.getElementById('live-view').classList.contains('active')){
+          switchTab('live');
+        }
       }
+    } else if(!_liveSource){
+      setLiveIndicator(false);
+      _liveRunId = null;
     }
   } catch(e){}
+  finally { _livePolling = false; }
 }
 
 // ── Templates ─────────────────────────────────────────────────
@@ -1448,7 +1563,9 @@ async function load(){
               </td>
               <td style="font-family:monospace;color:#79c0ff">${escHtml(l.masked_phone)}</td>
               <td style="color:#d2a8ff">${escHtml(trunc(l.category,18))}</td>
-              <td>${badge(l.r1_status)}</td>
+              <td>${badge(l.r1_status)}
+                  ${l.skip_reason?`<div class="skip-tag" title="${escHtml(prettyReason(l.skip_reason))}">${escHtml(trunc(prettyReason(l.skip_reason),36))}</div>`:''}
+              </td>
               <td>${l.r2_status?badge(l.r2_status):'<span style="color:#444">—</span>'}
                   ${l.scheduled_at?`<br><span class="sched-tag">&#128197; ${escHtml(l.scheduled_local)}</span>`:''}
                   ${l.reliability&&l.reliability.score?`<span class="rel-badge rel-${escHtml(l.reliability.score)}">${l.reliability.score==='green'?'✓ reliable':l.reliability.score==='red'?'✗ low':'~ ok'}</span>`:''}
@@ -1468,7 +1585,7 @@ async function load(){
                       'Address': l.address||'Not available in OSM',
                       'Candidate ID': l.candidate_id||'—',
                       'Status': l.status,
-                      'Skip reason': l.skip_reason||'—',
+                      'Skip reason': prettyReason(l.skip_reason)||'—',
                     }, 'lead')}
                     ${l.scheduled_at?`
                     <div style="margin-top:8px;padding:6px;background:#162016;border-radius:4px;font-size:.75rem">
@@ -1490,7 +1607,7 @@ async function load(){
 
                   <div class="exp-section">
                     <h4>&#128172; Full Transcript</h4>
-                    ${renderTranscript(l.transcript)}
+                    ${renderTranscript(l.transcript, l.r1_status, l.skip_reason)}
                   </div>
 
                 </div>
@@ -1650,6 +1767,9 @@ async function startCalling(){
 // Countdown + auto-refresh
 let t=8;
 setInterval(()=>{ t--; document.getElementById('cd').textContent=t; if(t<=0){t=8;load();pollLiveRuns();} },1000);
+// The 8s table refresh is too coarse for the Live tab: a sequential campaign mints a
+// new run id per lead, and the handover between leads has to look instant on camera.
+setInterval(pollLiveRuns, 2500);
 load();
 
 // ──── Callie AI Chatbot ────
@@ -2205,21 +2325,36 @@ def api_live_runs():
 @app.route("/api/live/<run_id>")
 def api_live_stream(run_id):
     """SSE stream for a live call run."""
-    from caller import register_live_queue, unregister_live_queue
-    q = register_live_queue(run_id)
+    from caller import attach_live_queue
+
+    # Attach to the producer's existing queue rather than replacing it, and never
+    # unregister on disconnect: the calling thread owns the channel's lifecycle.
+    # Re-registering here used to (a) drop every event published before the browser
+    # connected and (b) resurrect a finished run as a zombie entry that /api/live-runs
+    # then served forever, pinning the Live tab to a stream that never speaks again.
+    q, backlog = attach_live_queue(run_id)
 
     def _generate():
-        try:
-            while True:
-                try:
-                    event = q.get(timeout=20)
-                    yield f"data: {json.dumps(event)}\n\n"
-                    if event.get("type") == "done":
-                        break
-                except _queue.Empty:
-                    yield ": ping\n\n"  # keep-alive
-        finally:
-            unregister_live_queue(run_id)
+        if q is None:
+            # Run already finished (or never existed) — close it out immediately so
+            # the browser stops waiting and polls for the next lead's call.
+            yield f"data: {json.dumps({'type': 'done', 'status': 'ENDED'})}\n\n"
+            return
+        seen_done = False
+        for event in backlog:
+            yield f"data: {json.dumps(event)}\n\n"
+            if event.get("type") == "done":
+                seen_done = True
+        if seen_done:
+            return
+        while True:
+            try:
+                event = q.get(timeout=15)
+                yield f"data: {json.dumps(event)}\n\n"
+                if event.get("type") == "done":
+                    break
+            except _queue.Empty:
+                yield ": ping\n\n"  # keep-alive
 
     return Response(stream_with_context(_generate()), mimetype="text/event-stream",
                     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
@@ -2253,28 +2388,59 @@ def api_templates_post():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
-_running_campaigns: set = set()
+# campaign_id -> monotonic timestamp of when its run started.
+_running_campaigns: dict = {}
 _running_campaigns_lock = __import__("threading").Lock()
+
+# A run that has been "in progress" longer than this is treated as dead and its
+# lock can be taken over. The try/finally below already releases the lock on any
+# normal crash; this only covers a thread wedged forever (e.g. a `calle`
+# subprocess that never returns), which would otherwise make the campaign
+# permanently un-startable until the dashboard process is restarted.
+_RUNNING_LOCK_STALE_SECONDS = 30 * 60
+
+
+def _campaign_is_running(campaign_id: int) -> bool:
+    """True if a live (non-stale) pipeline thread currently holds this campaign."""
+    import time as _time
+    with _running_campaigns_lock:
+        started = _running_campaigns.get(campaign_id)
+    return started is not None and (_time.monotonic() - started) < _RUNNING_LOCK_STALE_SECONDS
+
 
 def _run_pipeline_bg(campaign_id: int, language: str, region: str):
     """Background thread: call not_called leads for a campaign. Guards against duplicate threads."""
-    import threading, json as _json
+    import threading, json as _json, time as _time
+    now = _time.monotonic()
     with _running_campaigns_lock:
-        if campaign_id in _running_campaigns:
+        started = _running_campaigns.get(campaign_id)
+        if started is not None and (now - started) < _RUNNING_LOCK_STALE_SECONDS:
             print(f"[Pipeline] Campaign #{campaign_id} already running — skipping duplicate start.")
             return
-        _running_campaigns.add(campaign_id)
+        if started is not None:
+            print(f"[Pipeline] Campaign #{campaign_id} had a stale run lock "
+                  f"({int(now - started)}s old) — taking it over.")
+        _running_campaigns[campaign_id] = now
     try:
         _run_pipeline_bg_inner(campaign_id, language, region)
     finally:
         with _running_campaigns_lock:
-            _running_campaigns.discard(campaign_id)
+            # Only clear our own entry; a takeover may have replaced it.
+            if _running_campaigns.get(campaign_id) == now:
+                _running_campaigns.pop(campaign_id, None)
 
 
 def _run_pipeline_bg_inner(campaign_id: int, language: str, region: str):
     """Inner pipeline logic."""
-    import threading, json as _json
+    import threading, json as _json, traceback as _tb
     from datetime import datetime, timezone
+
+    # Every dashboard-driven start path funnels through here, and each builds its
+    # own language/region value independently of main.py's --language default.
+    # A null/empty language means plan_call omits --language entirely, which is the
+    # ambiguity dead-end already fixed for the CLI — pin a default here too.
+    language = (language or "English")
+    region = (region or None)
 
     try:
         from script_gen import generate_goal
@@ -2287,6 +2453,7 @@ def _run_pipeline_bg_inner(campaign_id: int, language: str, region: str):
                 "SELECT product_description, consent_approved_at FROM campaigns WHERE id=?", (campaign_id,)
             ).fetchone()
             if not camp:
+                print(f"[Pipeline] Campaign #{campaign_id} not found — nothing to call.")
                 return
             if not camp["consent_approved_at"]:
                 # No real call is dispatched without an explicit consent gate having
@@ -2302,6 +2469,15 @@ def _run_pipeline_bg_inner(campaign_id: int, language: str, region: str):
                 (campaign_id,)
             ).fetchall()
 
+        if not leads:
+            # Not an error, but it is the most common "I clicked start and nothing
+            # happened" case (e.g. every discovered vendor was deduped away against
+            # an earlier campaign), so say so instead of exiting silently.
+            print(f"[Pipeline] Campaign #{campaign_id} has 0 leads in status 'not_called' — nothing to dial.")
+            return
+
+        print(f"[Pipeline] Campaign #{campaign_id}: dialing {len(leads)} lead(s) "
+              f"(language={language}, region={region}).")
         r1_goal = generate_goal(product, round_num=1)
 
         for lead in leads:
@@ -2347,7 +2523,7 @@ def _run_pipeline_bg_inner(campaign_id: int, language: str, region: str):
                     )
                     conn.commit()
 
-                if outcome in ("no_answer", "unknown", "failed", "busy") and lead["osm_id"]:
+                if outcome in ("no_answer", "unknown", "failed", "busy", "cancelled") and lead["osm_id"]:
                     schedule_retry(
                         lead_id=lead["id"], campaign_id=campaign_id,
                         product=product, attempt=0,
@@ -2355,11 +2531,29 @@ def _run_pipeline_bg_inner(campaign_id: int, language: str, region: str):
                         region=region, language=language,
                     )
             except Exception as e:
-                with get_conn() as conn:
-                    conn.execute("UPDATE leads SET status='failed' WHERE id=?", (lead["id"],))
-                    conn.commit()
-    except Exception:
-        pass
+                # One bad lead must never take down the rest of the campaign, and the
+                # reason has to be visible in the console during a live demo. The
+                # bookkeeping UPDATE is itself wrapped, because a failure there used to
+                # escape the loop and silently abort every remaining lead.
+                print(f"[Pipeline] Campaign #{campaign_id} lead {lead['id']} failed: {e}")
+                _tb.print_exc()
+                try:
+                    with get_conn() as conn:
+                        # Store the reason too — the leads table renders skip_reason
+                        # under the badge, so a failed lead explains itself instead of
+                        # showing a bare red "failed" with nothing behind it.
+                        conn.execute(
+                            "UPDATE leads SET status='failed', skip_reason=? WHERE id=?",
+                            (f"call error: {e}"[:400], lead["id"])
+                        )
+                        conn.commit()
+                except Exception as e2:
+                    print(f"[Pipeline] Could not mark lead {lead['id']} as failed: {e2}")
+                continue
+        print(f"[Pipeline] Campaign #{campaign_id} finished ({len(leads)} lead(s) processed).")
+    except Exception as e:
+        print(f"[Pipeline] Campaign #{campaign_id} aborted: {e}")
+        _tb.print_exc()
 
 
 @app.route("/api/discover", methods=["POST"])
@@ -2519,14 +2713,19 @@ def api_discover():
 @app.route("/api/campaigns/<int:campaign_id>/start", methods=["POST"])
 def api_campaign_start(campaign_id):
     data     = request.get_json(force=True) or {}
-    language = data.get("language", "Hindi")
-    region   = data.get("region", "IN")
+    # `or` (not a dict default): an explicit null/"" in the JSON body would otherwise
+    # produce language=None and drop --language from the plan_call invocation.
+    language = data.get("language") or "Hindi"
+    region   = data.get("region") or "IN"
 
     init_db()
     with get_conn() as conn:
         row = conn.execute(
             "SELECT consent_approved_at FROM campaigns WHERE id=?", (campaign_id,)
         ).fetchone()
+        not_called = conn.execute(
+            "SELECT COUNT(*) FROM leads WHERE campaign_id=? AND status='not_called'", (campaign_id,)
+        ).fetchone()[0]
     if not row:
         return jsonify({"started": False, "message": f"Campaign #{campaign_id} not found."}), 404
     if not row["consent_approved_at"]:
@@ -2535,6 +2734,17 @@ def api_campaign_start(campaign_id):
             "message": f"Campaign #{campaign_id} has not been approved yet. "
                        f"Call POST /api/campaign/{campaign_id}/approve first."
         }), 400
+    if not_called == 0:
+        # Don't answer "started" when the background thread will immediately find
+        # nothing to dial — that reads as a hang to whoever clicked the button.
+        return jsonify({
+            "started": False,
+            "message": f"Campaign #{campaign_id} has no uncalled leads — run discovery again "
+                       f"to add vendors before starting."
+        }), 400
+    if _campaign_is_running(campaign_id):
+        return jsonify({"started": True, "already_running": True, "campaign_id": campaign_id,
+                        "message": f"Campaign #{campaign_id} is already dialing."})
 
     import threading
     t = threading.Thread(
@@ -2552,26 +2762,38 @@ def api_approve_campaign(camp_id):
     then kick off the calling pipeline in a background thread."""
     from datetime import datetime, timezone
     data     = request.get_json(silent=True) or {}
-    language = data.get("language", "Hindi")
-    region   = data.get("region", "IN")
+    # `or` (not a dict default): an explicit null/"" in the JSON body would otherwise
+    # produce language=None and drop --language from the plan_call invocation.
+    language = data.get("language") or "Hindi"
+    region   = data.get("region") or "IN"
 
     init_db()
     with get_conn() as conn:
         row = conn.execute("SELECT id, consent_approved_at FROM campaigns WHERE id=?", (camp_id,)).fetchone()
         if not row:
             return jsonify({"ok": False, "message": f"Campaign #{camp_id} not found."}), 404
+        not_called = conn.execute(
+            "SELECT COUNT(*) FROM leads WHERE campaign_id=? AND status='not_called'", (camp_id,)
+        ).fetchone()[0]
         # Guard: don't re-approve an already-approved campaign that may already be running
         if row["consent_approved_at"]:
-            not_called = conn.execute(
-                "SELECT COUNT(*) FROM leads WHERE campaign_id=? AND status='not_called'", (camp_id,)
-            ).fetchone()[0]
             if not_called == 0:
                 return jsonify({"ok": False, "message": f"Campaign #{camp_id} already approved and has no uncalled leads."}), 400
+        elif not_called == 0:
+            # Consent on an empty campaign would stamp approval and then dial nothing,
+            # which looks identical to a hang. Fail loudly instead.
+            return jsonify({"ok": False,
+                            "message": f"Campaign #{camp_id} has no uncalled leads — run discovery "
+                                       f"again to add vendors before giving consent."}), 400
         conn.execute(
             "UPDATE campaigns SET consent_approved_at=? WHERE id=? AND consent_approved_at IS NULL",
             (datetime.now(timezone.utc).isoformat(), camp_id)
         )
         conn.commit()
+
+    if _campaign_is_running(camp_id):
+        return jsonify({"ok": True, "campaign_id": camp_id, "already_running": True,
+                        "message": f"Consent recorded — campaign #{camp_id} is already dialing."})
 
     import threading
     t = threading.Thread(
@@ -2593,7 +2815,7 @@ def _callie_build_context():
                 """SELECT COUNT(*) total,
                    SUM(CASE WHEN status='positive' THEN 1 ELSE 0 END) pos,
                    SUM(CASE WHEN status='negative' THEN 1 ELSE 0 END) neg,
-                   SUM(CASE WHEN status='no_answer' THEN 1 ELSE 0 END) noanswer,
+                   SUM(CASE WHEN status IN ('no_answer','busy','cancelled') THEN 1 ELSE 0 END) noanswer,
                    SUM(CASE WHEN status='not_called' THEN 1 ELSE 0 END) pending
                    FROM leads"""
             ).fetchone()
@@ -2659,7 +2881,7 @@ def _callie_tools():
             "description": "Get leads filtered by campaign or status.",
             "parameters": {"type": "object", "properties": {
                 "campaign_id": {"type": "integer"},
-                "status":      {"type": "string", "enum": ["positive","negative","no_answer","not_called","failed","skipped","unknown","completed"]},
+                "status":      {"type": "string", "enum": ["positive","negative","declined","no_answer","busy","not_called","failed","cancelled","skipped","unknown","completed"]},
                 "limit":       {"type": "integer"},
             }}
         }},
@@ -2827,10 +3049,17 @@ def _callie_exec_tool(fn_name, fn_args, user_msg=""):
         elif fn_name == "start_campaign":
             import threading
             camp_id  = int(fn_args.get("campaign_id"))
-            language = fn_args.get("language", "Hindi")
+            language = fn_args.get("language") or "Hindi"
+            region   = fn_args.get("region") or "IN"
             with get_conn() as conn:
                 if not conn.execute("SELECT id FROM campaigns WHERE id=?", (camp_id,)).fetchone():
                     return {"error": f"Campaign #{camp_id} not found."}, None
+                not_called = conn.execute(
+                    "SELECT COUNT(*) FROM leads WHERE campaign_id=? AND status='not_called'", (camp_id,)
+                ).fetchone()[0]
+            if not_called == 0:
+                return {"error": f"Campaign #{camp_id} has no uncalled leads — nothing to dial. "
+                                 f"Run discovery again to add vendors first."}, None
             if not _has_human_confirmation(user_msg):
                 # The model deciding on its own that "the user seems fine with it" is
                 # exactly how this tool used to place real calls with zero human
@@ -2845,7 +3074,11 @@ def _callie_exec_tool(fn_name, fn_args, user_msg=""):
                     (_dt.now(_tz.utc).isoformat(), camp_id)
                 )
                 conn.commit()
-            t = threading.Thread(target=_run_pipeline_bg, args=(camp_id, language, "IN"), daemon=True)
+            if _campaign_is_running(camp_id):
+                return {"started": True, "campaign_id": camp_id, "already_running": True,
+                        "message": f"Campaign #{camp_id} is already dialing."}, \
+                       {"type": "navigate_to", "tab": "live"}
+            t = threading.Thread(target=_run_pipeline_bg, args=(camp_id, language, region), daemon=True)
             t.start()
             return {"started": True, "campaign_id": camp_id,
                     "message": f"Calling pipeline started for campaign #{camp_id} in {language}."}, \
@@ -2862,7 +3095,7 @@ def _callie_exec_tool(fn_name, fn_args, user_msg=""):
                         """SELECT COUNT(*) total,
                            SUM(CASE WHEN status='positive' THEN 1 ELSE 0 END) pos,
                            SUM(CASE WHEN status='negative' THEN 1 ELSE 0 END) neg,
-                           SUM(CASE WHEN status='no_answer' THEN 1 ELSE 0 END) noanswer,
+                           SUM(CASE WHEN status IN ('no_answer','busy','cancelled') THEN 1 ELSE 0 END) noanswer,
                            SUM(CASE WHEN status='not_called' THEN 1 ELSE 0 END) pending
                            FROM leads WHERE campaign_id=?""", (c["id"],)
                     ).fetchone()
@@ -2940,7 +3173,7 @@ def _callie_exec_tool(fn_name, fn_args, user_msg=""):
                     """SELECT COUNT(*) total,
                        SUM(CASE WHEN status='positive' THEN 1 ELSE 0 END) pos,
                        SUM(CASE WHEN status='negative' THEN 1 ELSE 0 END) neg,
-                       SUM(CASE WHEN status='no_answer' THEN 1 ELSE 0 END) noanswer,
+                       SUM(CASE WHEN status IN ('no_answer','busy','cancelled') THEN 1 ELSE 0 END) noanswer,
                        SUM(CASE WHEN status='not_called' THEN 1 ELSE 0 END) pending,
                        SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) failed
                        FROM leads"""
@@ -2998,6 +3231,14 @@ def _callie_exec_tool(fn_name, fn_args, user_msg=""):
                     conn.execute("UPDATE leads SET lead_score=? WHERE id=?", (score, lead.id))
                     count += 1
                 conn.commit()
+            if count == 0:
+                # Every discovered vendor was filtered out (spam number, or the phone
+                # already exists on an earlier campaign). The campaign would be
+                # un-dialable, so say that rather than offering a dead "Give Consent" button.
+                return {"campaign_id": camp_id, "vendor_count": 0,
+                        "error": f"Campaign #{camp_id} was created but every vendor found is "
+                                 f"already in the database from an earlier search, so there is "
+                                 f"nothing new to call. Try a different product or location."}, None
             return {
                 "campaign_id": camp_id, "vendor_count": count,
                 "message": f"Found {count} vendors and created campaign #{camp_id} — nothing has been "
@@ -3085,7 +3326,7 @@ def _callie_exec_tool(fn_name, fn_args, user_msg=""):
                     """SELECT COUNT(*) total,
                        SUM(CASE WHEN status='positive' THEN 1 ELSE 0 END) pos,
                        SUM(CASE WHEN status='negative' THEN 1 ELSE 0 END) neg,
-                       SUM(CASE WHEN status='no_answer' THEN 1 ELSE 0 END) noanswer,
+                       SUM(CASE WHEN status IN ('no_answer','busy','cancelled') THEN 1 ELSE 0 END) noanswer,
                        SUM(CASE WHEN status='not_called' THEN 1 ELSE 0 END) pending,
                        SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) failed,
                        AVG(lead_score) avg_score
@@ -3130,12 +3371,12 @@ def _callie_exec_tool(fn_name, fn_args, user_msg=""):
                 result = conn.execute(
                     """UPDATE scheduled_calls SET scheduled_at=datetime('now', '+2 minutes'),
                        status='pending'
-                       WHERE lead_id IN (SELECT id FROM leads WHERE campaign_id=? AND status='no_answer')""",
+                       WHERE lead_id IN (SELECT id FROM leads WHERE campaign_id=? AND status IN ('no_answer','busy','cancelled'))""",
                     (camp_id,)
                 )
                 # Also insert new schedule rows for no_answer leads without an existing schedule
                 no_ans = conn.execute(
-                    """SELECT id FROM leads WHERE campaign_id=? AND status='no_answer'
+                    """SELECT id FROM leads WHERE campaign_id=? AND status IN ('no_answer','busy','cancelled')
                        AND id NOT IN (SELECT lead_id FROM scheduled_calls WHERE lead_id IS NOT NULL)""",
                     (camp_id,)
                 ).fetchall()
@@ -3147,7 +3388,7 @@ def _callie_exec_tool(fn_name, fn_args, user_msg=""):
                     )
                 conn.commit()
                 rescheduled = conn.execute(
-                    "SELECT COUNT(*) FROM leads WHERE campaign_id=? AND status='no_answer'", (camp_id,)
+                    "SELECT COUNT(*) FROM leads WHERE campaign_id=? AND status IN ('no_answer','busy','cancelled')", (camp_id,)
                 ).fetchone()[0]
             return {
                 "campaign_id": camp_id, "rescheduled": rescheduled,
