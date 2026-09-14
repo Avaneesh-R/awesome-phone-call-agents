@@ -500,7 +500,11 @@ def main():
                              "(does not stop a call already in progress).")
     parser.add_argument("--limit", type=int, default=10, help="Max vendors to discover (default 10)")
     parser.add_argument("--region", default=None, help="Region hint for CALL-E (e.g. US, IN, GB)")
-    parser.add_argument("--language", default=None, help="Language hint for CALL-E (e.g. English)")
+    parser.add_argument("--language", default="English",
+                        help="Language hint for CALL-E (e.g. English). Defaults to English — "
+                             "CALL-E asks a clarifying question instead of planning the call when "
+                             "no language is given for a number where it's ambiguous, which this "
+                             "code was treating as a hard failure rather than answering it.")
     parser.add_argument("--live", action="store_true",
                         help="Actually place real calls via CALL-E. Without this, campaigns "
                              "always run in dry-run mode (plan only, nothing dialed).")

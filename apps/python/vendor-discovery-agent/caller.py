@@ -71,13 +71,34 @@ def _call_groq(client, **kwargs):
     return client.chat.completions.create(**kwargs)
 
 
+_TIMEOUT_RETRY_BUDGET = 2  # extra attempts if the backend itself times out
+
 def _run(args: list[str]) -> dict:
-    result = subprocess.run(
-        [CALLE] + args,
-        capture_output=True, text=True, encoding="utf-8", env=_CALLE_ENV
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"calle {' '.join(args)} failed:\n{result.stderr}")
+    # Without an explicit timeout the calle CLI's own default can be shorter than
+    # a real response sometimes takes (~15-20s observed for plan_call, including
+    # for a rejected/unsupported-region response) — that gap was showing up as a
+    # generic "MCP request timed out" instead of the actual answer.
+    if "--timeout-seconds" not in args:
+        args = args + ["--timeout-seconds", "60"]
+
+    attempt = 0
+    while True:
+        result = subprocess.run(
+            [CALLE] + args,
+            capture_output=True, text=True, encoding="utf-8", env=_CALLE_ENV
+        )
+        if result.returncode != 0:
+            # The backend itself is occasionally slow enough to time out even at
+            # 60s, independent of region support — retry a couple of times before
+            # giving up, rather than failing a whole campaign on one flaky request.
+            if "timed out" in (result.stderr or "").lower() and attempt < _TIMEOUT_RETRY_BUDGET:
+                attempt += 1
+                print(f"  [Retry] calle request timed out (attempt {attempt}/{_TIMEOUT_RETRY_BUDGET})...")
+                time.sleep(3)
+                continue
+            raise RuntimeError(f"calle {' '.join(args)} failed:\n{result.stderr}")
+        break
+
     try:
         outer = json.loads(result.stdout)
     except json.JSONDecodeError as e:
