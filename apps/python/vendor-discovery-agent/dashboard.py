@@ -744,7 +744,7 @@ tbody tr.lead-row:hover{background:linear-gradient(90deg,rgba(99,102,241,.08),rg
   <div id="wiz-step1">
     <div class="wiz-form">
       <div class="wiz-field full">
-        <label class="wiz-label">What do you want to source?</label>
+        <label class="wiz-label">What do you need supplied?</label>
         <input class="wiz-input" id="wiz-product" placeholder="e.g. organic rice in bulk, office furniture, stationery supplies" />
       </div>
       <div class="wiz-field full">

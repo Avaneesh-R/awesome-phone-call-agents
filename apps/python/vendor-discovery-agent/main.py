@@ -498,7 +498,7 @@ def run_campaign(product: str, location: str, limit: int,
 
 def main():
     parser = argparse.ArgumentParser(description="Vendor Discovery & Outreach via CALL-E + OSM")
-    parser.add_argument("--product", default=None, help="Product or service to source")
+    parser.add_argument("--product", default=None, help="Product or service you need supplied")
     parser.add_argument("--location", default=None, help="Location to search (city, region, etc.)")
     parser.add_argument("--cancel-campaign", type=int, default=None, metavar="CAMPAIGN_ID",
                         help="Cancel every still-pending scheduled call for a campaign and exit "

@@ -4,11 +4,11 @@ Produces the --goal string passed to CALL-E for round 1 and round 2.
 The client MUST review and approve the script before any calls are placed.
 """
 
-ROUND1_TEMPLATE = """You are calling on behalf of a client who is looking to source {product}.
+ROUND1_TEMPLATE = """You are calling on behalf of a client who needs {product} supplied.
 Your goal is to find out whether this business can supply {product} and whether they would be
 interested in discussing a potential supply arrangement.
 
-Keep the call brief and professional. Introduce yourself as a sourcing agent.
+Keep the call brief and professional. Introduce yourself as a supply agent.
 Ask:
 1. Whether they supply or sell {product}.
 2. If yes, whether they would be open to a follow-up conversation about quantities and pricing.
