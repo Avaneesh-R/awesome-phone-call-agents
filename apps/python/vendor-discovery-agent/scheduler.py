@@ -10,6 +10,7 @@ import json, os, re, threading, time as _time
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from models import get_conn, _mask_phone
+from call_safety import redact_phones
 
 _lock = threading.Lock()
 _scheduler_started = False
@@ -325,7 +326,9 @@ def _fire(row) -> None:
                 )
                 print(f"  [Scheduler] R1 retry positive for lead {lead_id} — R2 scheduled.")
 
-            elif outcome in ("no_answer", "busy", "failed", "cancelled"):
+            # Only clean "nobody answered / line busy" outcomes are retried. failed,
+            # cancelled and unknown outcomes may already have reached the vendor.
+            elif outcome in ("no_answer", "busy"):
                 retry_count = _get_retry_count(lead_id)
                 scheduled = schedule_retry(
                     lead_id=lead_id, campaign_id=campaign_id, product=product,
@@ -414,7 +417,7 @@ def _fire(row) -> None:
                 print(f"  [Scheduler] Could not parse time from: '{new_timeline[:60]}'")
 
     except Exception as e:
-        print(f"  [Scheduler] Call failed for lead {lead_id}: {e}")
+        print(f"  [Scheduler] Call failed for lead {lead_id}: {redact_phones(str(e))}")
         _update_status(sched_id, "failed")
 
 
@@ -468,17 +471,25 @@ def _poll_loop():
 
 
 def _recover_stale_in_progress():
-    """Reset in_progress rows older than 15 minutes back to pending on startup."""
+    """Quarantine in_progress rows left over from a previous process.
+
+    A row is 'in_progress' from the moment it is claimed until its call resolves, so
+    a leftover row means the process died mid-call: the call may already have been
+    placed. Resetting it to 'pending' (the old behaviour) would redial the vendor.
+    These rows are marked 'ambiguous' instead and are never fired again
+    automatically; an operator checks the CALL-E run and reschedules by hand.
+    """
     from datetime import datetime, timezone, timedelta
     cutoff = (datetime.now(timezone.utc) - timedelta(minutes=15)).isoformat()
     with get_conn() as conn:
         updated = conn.execute(
-            "UPDATE scheduled_calls SET status='pending' WHERE status='in_progress' AND created_at < ?",
+            "UPDATE scheduled_calls SET status='ambiguous' WHERE status='in_progress' AND created_at < ?",
             (cutoff,)
         ).rowcount
         conn.commit()
     if updated:
-        print(f"[Scheduler] Recovered {updated} stale in_progress row(s) → pending")
+        print(f"[Scheduler] Marked {updated} interrupted in_progress row(s) as 'ambiguous' "
+              f"— not redialed; check the CALL-E run before rescheduling.")
 
 
 def start_scheduler_thread():

@@ -11,6 +11,8 @@ import urllib.request
 import urllib.parse
 from typing import Optional
 
+from call_safety import validate_e164
+
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 
 # (south, west, north, east) bounding boxes for common Indian cities — avoids Nominatim calls
@@ -295,20 +297,22 @@ def _run_overpass(query: str) -> list[dict]:
 
 
 def _normalize_phone(raw: str) -> Optional[str]:
-    cleaned = re.sub(r'[^\d+]', '', raw)
-    if not cleaned:
+    """Return the listing's number only if it is already unambiguous E.164.
+
+    Only visual separators (spaces, dashes, dots, parentheses) are removed. A number
+    that does not already carry its own "+<country code>" is dropped rather than
+    guessed at: prefixing "+" onto a local or trunk-prefixed number (e.g. "011 ...")
+    produces a different, possibly real, destination. Non-ASCII digits are rejected.
+    """
+    if not isinstance(raw, str) or not raw.isascii():
         return None
-    # OSM sometimes concatenates multiple numbers: "+919812345678+919876543210"
-    # Split on every '+' boundary after the first character and take the first segment
-    parts = re.split(r'(?<=\d)(?=\+)', cleaned)
-    digits = parts[0].strip()
-    if not digits:
-        return None
-    if not digits.startswith('+'):
-        digits = '+' + digits
-    if len(digits) < 8:
-        return None
-    return digits
+    # OSM separates multiple numbers with ';' (sometimes ','); take the first.
+    first = re.split(r'[;,]', raw)[0].strip()
+    cleaned = re.sub(r'[ \-.()/]', '', first)
+    # Concatenated numbers with no separator: "+919812345678+919876543210"
+    cleaned = re.split(r'(?<=[0-9])(?=\+)', cleaned)[0]
+    ok, _ = validate_e164(cleaned)
+    return cleaned if ok else None
 
 
 def _looks_spam(phone: str) -> bool:

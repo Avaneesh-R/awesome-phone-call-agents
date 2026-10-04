@@ -12,6 +12,9 @@ import queue as _queue
 import threading as _threading
 from pathlib import Path
 
+from call_safety import (ATTESTED_BASIS, validate_e164, mask_phone, redact_phones,
+                         safe_plan)
+
 import os as _os
 import shutil as _shutil
 import sys as _sys
@@ -176,7 +179,26 @@ def _run_id_from_content(result) -> str:
     return m.group(1) if m else ""
 
 
-_TIMEOUT_RETRY_BUDGET = 2  # extra attempts if the backend itself times out
+_TIMEOUT_RETRY_BUDGET = 2  # extra attempts for read-only/planning requests only
+
+
+class AmbiguousCallSubmission(RuntimeError):
+    """`calle call run` did not return a clean answer. The call may or may not have
+    been placed, so it must never be retried automatically."""
+
+
+def _failure_kind(stderr: str) -> str:
+    """Coarse, non-sensitive category for a failed calle invocation. Raw stderr can
+    echo the destination, goal or provider internals, so it is never surfaced."""
+    s = (stderr or "").lower()
+    if "timed out" in s or "timeout" in s:
+        return "timed out"
+    if "fetch failed" in s:
+        return "fetch failed"
+    if "unauthor" in s or "login" in s or "401" in s:
+        return "not authenticated"
+    return "error"
+
 
 def _run(args: list[str]) -> dict:
     # Without an explicit timeout the calle CLI's own default can be shorter than
@@ -186,6 +208,14 @@ def _run(args: list[str]) -> dict:
     if "--timeout-seconds" not in args:
         args = args + ["--timeout-seconds", "60"]
 
+    # Only the command name (e.g. "call plan") is ever put in an error message —
+    # never the arguments (phone number, goal, tokens) or raw stderr.
+    cmd = " ".join(args[:2])
+    # `call run` is the one command that places a call. A timeout or error there is
+    # an ambiguous submission: the call may already be ringing, so it is NEVER
+    # retried here. Plan/status requests have no side effects and may be retried.
+    is_submission = args[:2] == ["call", "run"]
+
     attempt = 0
     while True:
         result = subprocess.run(
@@ -193,22 +223,25 @@ def _run(args: list[str]) -> dict:
             capture_output=True, text=True, encoding="utf-8", env=_CALLE_ENV
         )
         if result.returncode != 0:
-            # The backend itself is occasionally slow enough to time out even at
-            # 60s, independent of region support — retry a couple of times before
-            # giving up, rather than failing a whole campaign on one flaky request.
-            if "timed out" in (result.stderr or "").lower() and attempt < _TIMEOUT_RETRY_BUDGET:
+            kind = _failure_kind(result.stderr)
+            if is_submission:
+                raise AmbiguousCallSubmission(
+                    f"calle {cmd} {kind} (exit {result.returncode}); outcome unknown, not retried")
+            if kind == "timed out" and attempt < _TIMEOUT_RETRY_BUDGET:
                 attempt += 1
-                print(f"  [Retry] calle request timed out (attempt {attempt}/{_TIMEOUT_RETRY_BUDGET})...")
+                print(f"  [Retry] calle {cmd} timed out (attempt {attempt}/{_TIMEOUT_RETRY_BUDGET})...")
                 time.sleep(3)
                 continue
-            raise RuntimeError(f"calle {' '.join(args)} failed:\n{result.stderr}")
+            raise RuntimeError(f"calle {cmd} failed: {kind} (exit {result.returncode})")
         break
 
     try:
         outer = json.loads(result.stdout)
     except json.JSONDecodeError as e:
-        snippet = result.stdout[-300:] if result.stdout else "(empty)"
-        raise RuntimeError(f"calle JSON parse error: {e}\nStdout tail: {snippet}") from e
+        if is_submission:
+            raise AmbiguousCallSubmission(
+                f"calle {cmd} returned an unreadable response; outcome unknown, not retried") from None
+        raise RuntimeError(f"calle {cmd} returned an unreadable response") from None
     # CLI wraps everything in {ok, result: {structuredContent, content, isError}}
     # Return structuredContent directly so callers get the flat schema.
     #
@@ -277,12 +310,13 @@ def plan_rejection_reason(plan: dict) -> str:
 
 def describe_plan_rejection(plan: dict) -> str:
     """Turn a non-dialable plan response into a short skip_reason a human can read."""
-    reason = plan_rejection_reason(plan)
+    reason = redact_phones(plan_rejection_reason(plan))
     if reason and _UNSUPPORTED_REGION_RE.search(reason):
         return f"region not supported: {reason}"
     if reason:
         return f"call not planned: {reason}"
-    return f"call not planned: CALL-E returned no confirm token ({json.dumps(plan)[:200]})"
+    # The raw plan carries the destination number, so it is never echoed here.
+    return "call not planned: CALL-E returned no confirm token"
 
 
 TERMINAL_STATUSES = {"COMPLETED","FAILED","NO_ANSWER","NO ANSWER","BUSY","CANCELLED","DECLINED",
@@ -320,13 +354,7 @@ def poll_until_done(run_id: str, on_update=None, live_id: str = None, live_meta:
                 time.sleep(POLL_INTERVAL)
                 continue
             raise  # exhaust budget or non-transient error
-        _publish_live(live_id, {
-            "type": "status",
-            "status": status.get("status", ""),
-            "transcript": parse_transcript_to_json(status),
-            "summary": (status.get("result") or {}).get("summary", ""),
-            **live_meta,
-        })
+        _publish_live(live_id, _masked_status_event(status, live_meta))
         if on_update:
             on_update(status)
         raw = status.get("status", "")
@@ -335,17 +363,35 @@ def poll_until_done(run_id: str, on_update=None, live_id: str = None, live_meta:
             return status
         time.sleep(POLL_INTERVAL)
     final_status = _run(["call", "status", "--run-id", run_id])
-    _publish_live(live_id, {
-        "type": "status",
-        "status": final_status.get("status", ""),
-        "transcript": parse_transcript_to_json(final_status),
-        "summary": (final_status.get("result") or {}).get("summary", ""),
-        **live_meta,
-    })
+    _publish_live(live_id, _masked_status_event(final_status, live_meta))
     if on_update:
         on_update(final_status)
-    _publish_live(live_id, {"type": "done", "status": terminal_label(final_status.get("status", "")), **live_meta})
+    raw = final_status.get("status", "")
+    if not (raw in TERMINAL_STATUSES or raw.upper().replace(" ", "_") in TERMINAL_STATUSES):
+        # Still not terminal after the polling budget: the outcome is unknown. Mark it
+        # so no caller treats it as a clean failure and redials.
+        final_status["ambiguous"] = True
+        _publish_live(live_id, {"type": "done",
+                                "status": "UNKNOWN — still in progress at poll timeout; not retried",
+                                **live_meta})
+        return final_status
+    _publish_live(live_id, {"type": "done", "status": terminal_label(raw), **live_meta})
     return final_status
+
+
+def _masked_status_event(status: dict, live_meta: dict) -> dict:
+    """Live-console event with phone numbers redacted from transcript and summary."""
+    transcript = [
+        {**line, "text": redact_phones(line.get("text", ""))}
+        for line in parse_transcript_to_json(status)
+    ]
+    return {
+        "type": "status",
+        "status": status.get("status", ""),
+        "transcript": transcript,
+        "summary": redact_phones((status.get("result") or {}).get("summary", "") or ""),
+        **live_meta,
+    }
 
 
 def classify_round1(status_output: dict) -> str:
@@ -529,28 +575,53 @@ def infer_from_transcript(transcript_lines: list[dict], product_description: str
 def execute_call_pipeline(phone: str, goal: str, region: str = None, language: str = None,
                            dry_run: bool = False,
                            lat: float = None, lon: float = None,
-                           campaign_id: int = None) -> dict:
+                           campaign_id: int = None,
+                           recipient_authorized: bool = False) -> dict:
     """
     Full plan → confirm → run → poll pipeline.
     Returns the final status output dict.
     dry_run=True plans but does not execute (for testing).
     lat/lon used for business-hours gating (skips call if outside 09:00-18:00 local).
-    campaign_id, if given, is independently checked against campaigns.consent_approved_at
-    here — this is the actual call-dispatch chokepoint, so a caller that skips the
-    application-layer consent check (dashboard route, CLI gate, etc.) still can't get
-    a real call placed for a campaign that was never approved.
+
+    This is the actual call-dispatch chokepoint. Before any live call it independently
+    checks, regardless of which caller (CLI, dashboard, assistant, scheduler) got here:
+      * the destination is exact ASCII E.164 and belongs to `region`;
+      * the operator has attested that the recipient authorized the call — recorded on
+        the campaign (consent_basis == ATTESTED_BASIS) when campaign_id is given, or
+        passed explicitly as recipient_authorized=True for a one-off call.
+    Discovering a vendor in a public directory is not recipient authorization.
+
+    A `call run` that times out or returns no run_id is an ambiguous submission: the
+    call may have been placed. It is returned as SKIPPED with an
+    "ambiguous_submission" reason and is never retried automatically.
     """
     from business_hours import is_business_hours, business_hours_reason
-    from models import _mask_phone, get_conn
+    from models import get_conn
 
-    if not dry_run and campaign_id is not None:
-        with get_conn() as conn:
-            row = conn.execute(
-                "SELECT consent_approved_at FROM campaigns WHERE id=?", (campaign_id,)
-            ).fetchone()
-        if not row or not row["consent_approved_at"]:
-            print(f"  Blocking — campaign #{campaign_id} has no recorded consent.")
-            return {"status": "SKIPPED", "skip_reason": "no_consent_on_record"}
+    ok, why = validate_e164(phone, region)
+    if not ok:
+        print(f"  Blocking — invalid destination {mask_phone(phone)}: {why}.")
+        return {"status": "SKIPPED", "skip_reason": f"invalid_destination: {why}"}
+
+    if not dry_run:
+        if not region:
+            print("  Blocking — live calls require an explicit region.")
+            return {"status": "SKIPPED", "skip_reason": "region_required_for_live_call"}
+        if campaign_id is not None:
+            with get_conn() as conn:
+                row = conn.execute(
+                    "SELECT consent_approved_at, consent_basis FROM campaigns WHERE id=?",
+                    (campaign_id,)
+                ).fetchone()
+            if not row or not row["consent_approved_at"]:
+                print(f"  Blocking — campaign #{campaign_id} has no recorded consent.")
+                return {"status": "SKIPPED", "skip_reason": "no_consent_on_record"}
+            if row["consent_basis"] != ATTESTED_BASIS:
+                print(f"  Blocking — campaign #{campaign_id} has no recipient-authorization attestation.")
+                return {"status": "SKIPPED", "skip_reason": "no_recipient_authorization_attestation"}
+        elif not recipient_authorized:
+            print("  Blocking — no recipient-authorization attestation for this call.")
+            return {"status": "SKIPPED", "skip_reason": "no_recipient_authorization_attestation"}
 
     reason = business_hours_reason(lat=lat, lon=lon)
     print(f"  Hours check: {reason}")
@@ -572,7 +643,7 @@ def execute_call_pipeline(phone: str, goal: str, region: str = None, language: s
         _publish_live(live_id, {"type": "status", "status": "PLANNING",
                                 "summary": f"Preparing call to {live_label}{_progress}…",
                                 **live_meta})
-        print(f"\n  Planning call to {_mask_phone(phone)}...")
+        print(f"\n  Planning call to {mask_phone(phone)}...")
         plan = plan_call(phone, goal, region, language)
 
         plan_id = plan.get("plan_id")
@@ -588,32 +659,44 @@ def execute_call_pipeline(phone: str, goal: str, region: str = None, language: s
             _publish_live(live_id, {"type": "done",
                                     "status": "NOT DIALED — " + skip_reason[:140],
                                     "summary": skip_reason[:200], **live_meta})
-            return {"status": "SKIPPED", "skip_reason": skip_reason, "plan": plan}
+            return {"status": "SKIPPED", "skip_reason": skip_reason, "plan": safe_plan(plan)}
 
         print(f"  Plan ID: {plan_id}")
 
         if dry_run:
             print("  [DRY RUN] Skipping execution.")
             _publish_live(live_id, {"type": "done", "status": "dry_run", **live_meta})
-            return {"status": "dry_run", "plan": plan}
+            return {"status": "dry_run", "plan": safe_plan(plan)}
 
         print("  Executing call...")
         _publish_live(live_id, {"type": "status", "status": "DIALING",
                                 "summary": f"Dialing {live_label}{_progress}…",
                                 **live_meta})
-        run_result = run_call(plan_id, confirm_token)
+        try:
+            run_result = run_call(plan_id, confirm_token)
+        except AmbiguousCallSubmission as e:
+            return _ambiguous(live_id, live_meta, str(e))
         run_id = run_result.get("run_id") or run_result.get("id")
         if not run_id:
-            raise RuntimeError(f"run_call did not return run_id: {run_result}")
+            # The submission was accepted but we have no handle on it, so we can't
+            # tell whether a call is ringing. Stop; never redial.
+            return _ambiguous(live_id, live_meta, "call run returned no run_id; outcome unknown")
 
         print(f"  Run ID: {run_id} — polling for completion...")
-        final_status = poll_until_done(run_id, live_id=live_id, live_meta=live_meta)
+        try:
+            final_status = poll_until_done(run_id, live_id=live_id, live_meta=live_meta)
+        except Exception as e:
+            # The call was submitted; only its status is unknown. Treat as ambiguous.
+            return _ambiguous(live_id, live_meta,
+                              f"status unavailable after submission ({redact_phones(str(e))[:120]})",
+                              run_id=run_id)
     except Exception as e:
         # Surface the failure in the console instead of letting the live indicator
         # spin forever on a run that will never publish another event.
+        msg = redact_phones(str(e))
         _publish_live(live_id, {"type": "done",
-                                "status": "FAILED — " + str(e)[:140],
-                                "summary": str(e)[:200], **live_meta})
+                                "status": "FAILED — " + msg[:140],
+                                "summary": msg[:200], **live_meta})
         raise
     finally:
         # The SSE generator holds its own reference to the queue, so any events
@@ -621,6 +704,10 @@ def execute_call_pipeline(phone: str, goal: str, region: str = None, language: s
         unregister_live_queue(live_id)
     raw_status = (final_status.get("status") or "").upper().replace(" ", "_")
     print(f"  Done. Status: {raw_status}")
+    if final_status.get("ambiguous"):
+        return {"status": "SKIPPED", "run_id": run_id,
+                "skip_reason": "ambiguous_submission: call still unresolved at poll timeout; "
+                               "not retried — check the CALL-E run before calling again"}
 
     # Detect CALLE's report_blocked — vendor requested a callback but CALLE won't auto-retry.
     # Inject a synthetic "callback_requested" key so callers can detect and schedule.
@@ -630,3 +717,16 @@ def execute_call_pipeline(phone: str, goal: str, region: str = None, language: s
         print("  [Pipeline] CALLE report_blocked — callback scheduling handed to us.")
 
     return final_status
+
+
+def _ambiguous(live_id: str, live_meta: dict, detail: str, run_id: str = None) -> dict:
+    """Stop after an ambiguous submission. Returned as SKIPPED so every caller records
+    the reason on the lead and none of them schedules a retry or redial."""
+    reason = f"ambiguous_submission: {detail} — not retried; check the CALL-E run before calling again"
+    print(f"  Stopping — {reason}")
+    _publish_live(live_id, {"type": "done", "status": "UNKNOWN — " + detail[:120],
+                            "summary": reason[:200], **live_meta})
+    out = {"status": "SKIPPED", "skip_reason": reason}
+    if run_id:
+        out["run_id"] = run_id
+    return out

@@ -55,8 +55,8 @@ assert "Europe/London" in reason, f"Expected Europe/London in: {reason}"
 for status_str, expected in [
     ("NO ANSWER", "no_answer"),
     ("NO_ANSWER", "no_answer"),
-    ("DECLINED", "no_answer"),
-    ("BUSY", "no_answer"),
+    ("DECLINED", "declined"),
+    ("BUSY", "busy"),
     ("FAILED", "failed"),
 ]:
     result = classify_round1({"status": status_str})

@@ -21,9 +21,15 @@ Built for the CALL-E Hackathon (deadline Sep 14 2026).
 - **Infer** — Groq (Llama) reads each transcript and extracts structured fields.
 - **Dry-run by default** — every campaign plans calls but places none unless you pass
   `--live`. Nothing dials without that explicit flag.
-- **Consent gate enforced at the dispatch point** — the function that actually places
-  a call independently checks that a human has approved the campaign, so nothing —
-  not the CLI, not the dashboard, not the AI assistant — can route around it.
+- **Recipient-authorization gate enforced at the dispatch point** — a live call needs
+  the operator's explicit attestation that every recipient authorized the call, plus a
+  strict ASCII E.164 destination for the chosen region. The function that actually
+  places a call checks both itself, so nothing — not the CLI, not the dashboard, not
+  the AI assistant, not the scheduler — can route around it. Being listed on
+  OpenStreetMap is **not** recipient authorization.
+- **No automatic redial after an ambiguous outcome** — if `calle call run` times out,
+  errors, returns no run ID, or the call is still unresolved when polling ends, the
+  lead is marked `skipped / ambiguous_submission` and never retried automatically.
 - **Business-hours gating** — resolves each vendor's timezone and skips the call
   outside 09:00–18:00 local; fails *closed* (skips) if the timezone can't be resolved.
 - **Cancellable follow-ups** — scheduled retries and callbacks can be cancelled before
@@ -64,14 +70,18 @@ dials — safe to run with no CALL-E credits spent and no phone rings.
 python main.py --product "office chairs" --location "London, UK"
 ```
 
-### Real campaign (requires --live)
+### Real campaign (requires --live, --region and your attestation)
+Only run this for vendors who have authorized you to call them (an existing supplier
+relationship, a prior opt-in). You will be asked to type `I ATTEST`; for
+non-interactive runs pass `--attest-recipient-authorization`. `--yes` only skips the
+vendor-list prompt — it never attests for you.
 ```
-python main.py --product "leather shoes" --location "London, UK" --limit 5 --live --yes
+python main.py --product "leather shoes" --location "Mumbai, India" --region IN --limit 5 --live
 ```
 
 ### With Excel export
 ```
-python main.py --product "hardware tools" --location "Berlin, Germany" --limit 10 --live --export-excel results.xlsx
+python main.py --product "hardware tools" --location "Berlin, Germany" --limit 10 --export-excel results.xlsx
 ```
 
 ### All flags
@@ -79,11 +89,13 @@ python main.py --product "hardware tools" --location "Berlin, Germany" --limit 1
   --product        Product or service to source (required)
   --location       City or region to search (required)
   --limit          Max vendors to discover (default 10)
-  --region         Region hint for CALL-E, e.g. GB, US, IN
+  --region         Region for CALL-E and E.164 validation, e.g. GB, US, IN (required with --live)
   --language       Region hint for CALL-E, e.g. English
   --live           Actually place real calls. Without this, always dry-run.
   --dry-run        Explicit no-op — dry-run is already the default without --live
-  --yes / -y       Skip all interactive confirmation prompts
+  --yes / -y       Skip the vendor-list confirmation prompt (does not attest)
+  --attest-recipient-authorization
+                   With --live: attest that every recipient authorized the calls
   --export-excel   Export results to .xlsx after campaign
   --export-csv     Export results to .csv after campaign
   --export-json    Export results to .json after campaign
@@ -142,15 +154,40 @@ models.py            SQLite schema: campaigns, leads, call_logs, scheduled_calls
 dashboard.py         Flask web UI + Callie AI assistant
 ```
 
-### Consent gate
+### Recipient-authorization gate
 
-Every campaign records `consent_approved_at` (UTC ISO timestamp) and `consent_basis`
-in the database at the moment a human confirms the vendor list. The check isn't only
-in the CLI prompt or the dashboard route — `caller.py`'s `execute_call_pipeline`, the
-actual function that dials, independently verifies consent via the database whenever
-it's given a campaign ID. No caller — CLI, dashboard, scheduler, or the AI assistant —
-can place a real call for a campaign that was never approved. The `--yes` flag
-auto-confirms but still records the timestamp — it does not bypass the gate.
+Discovering a business in a public directory, or having a business reason to call it,
+is not authorization to call it. Before any live call the operator must attest that
+every recipient has authorized the call:
+
+- **CLI:** type `I ATTEST` at the prompt (or pass `--attest-recipient-authorization`).
+- **Dashboard:** tick the attestation checkbox in the wizard, or confirm the
+  attestation dialog on "Attest & Call" in the Campaigns tab.
+- **AI assistant:** cannot attest on your behalf; it can only start a campaign you
+  have already attested in the UI.
+
+The attestation is stored as `consent_basis = operator-attested-recipient-authorization`
+alongside `consent_approved_at`. `caller.py`'s `execute_call_pipeline` — the function
+that actually dials — re-checks it from the database for every live call, and for a
+one-off call without a campaign it requires `recipient_authorized=True`. Campaigns
+approved before this gate existed must be attested again before they can dial.
+
+### Destination validation (E.164)
+
+Every destination must already be exact ASCII E.164 (`+<country code><number>`, 8–15
+digits, no spaces) and match the campaign region (`--region`, required for live
+calls). Discovery keeps only OpenStreetMap numbers that are already written with their
+own `+<country code>`; numbers without one are dropped rather than guessed at, so some
+listings will no longer appear.
+
+### Ambiguous outcomes
+
+A timed-out or failed `calle call run`, a run with no run ID, or a call still
+unresolved when polling ends is an ambiguous submission — the vendor may already have
+been called. These are recorded as `skipped / ambiguous_submission: …` and are never
+retried. Only clean `NO_ANSWER` / `BUSY` outcomes are retried automatically. Scheduled
+calls interrupted by a crash are marked `ambiguous` on restart instead of being
+re-queued. Check the run in CALL-E before calling that vendor again.
 
 ### Business hours
 
@@ -163,7 +200,11 @@ silently placed.
 ### Phone masking
 
 All phone numbers are masked (`+44****123`) in logs, the dashboard, Excel/CSV/JSON
-output, and any file that could appear in version control. Raw phone numbers are
+output, and any file that could appear in version control. Phone numbers spoken in
+transcripts or summaries are redacted in the live console and console output, plans
+are never returned or printed with their destination, and raw `calle` command lines
+and stderr are never surfaced — errors carry only a short category such as
+`timed out`. Raw phone numbers are
 stored only in the local SQLite database, which is not committed to git.
 
 ---
@@ -201,7 +242,12 @@ no further calls will be dispatched.
 
 ```
 python test_pipeline.py
+python smoke_test_full.py      # discovery + scripts + DRY-RUN plan; never dials
 ```
+
+`smoke_test_full.py` places a real call only with
+`--live --to +<E.164> --region <XX> --attest-recipient-authorization`; there is no
+default live destination.
 
 A no-call smoke test: exercises campaign/lead database saves, phone masking, the
 business-hours gate, call-status classification, and Groq transcript inference —

@@ -30,6 +30,7 @@ _load_user_env_vars()
 from flask import Flask, jsonify, render_template_string, Response, stream_with_context, request
 import queue as _queue
 from models import get_conn, init_db, _mask_phone
+from call_safety import ATTESTED_BASIS, ATTESTATION_TEXT, redact_phones
 from scheduler import start_scheduler_thread
 
 app = Flask(__name__)
@@ -787,7 +788,7 @@ tbody tr.lead-row:hover{background:linear-gradient(90deg,rgba(99,102,241,.08),rg
     <div style="margin-bottom:12px;padding:10px 14px;background:#162016;border:1px solid #2a5a2a;border-radius:6px;display:flex;align-items:flex-start;gap:10px">
       <input type="checkbox" id="wiz-consent" onchange="toggleStartBtn()" style="margin-top:3px;accent-color:#56d364;width:15px;height:15px;flex-shrink:0">
       <label for="wiz-consent" style="font-size:.8rem;color:#c9d1d9;cursor:pointer;line-height:1.5">
-        I confirm I have a <strong style="color:#56d364">legitimate business reason</strong> to contact these vendors and understand that calls will be made on my behalf. I take responsibility for any outreach initiated.
+        I attest that <strong style="color:#56d364">every recipient listed above has authorized me to call them</strong> (for example, an existing supplier relationship or a prior opt-in). A public directory listing or a business reason alone is not authorization. Real calls will be placed on my behalf.
       </label>
     </div>
     <div class="start-row">
@@ -854,6 +855,9 @@ tbody tr.lead-row:hover{background:linear-gradient(90deg,rgba(99,102,241,.08),rg
 </div>
 
 <script>
+// Mirrors call_safety.ATTESTATION_TEXT
+const ATTESTATION_TEXT = "I attest that every recipient in this campaign has authorized me to call them (for example, an existing supplier relationship or a prior opt-in). A public directory listing or a business purpose alone is not authorization.";
+
 const SC = {
   positive:'s-positive', negative:'s-negative', no_answer:'s-no_answer',
   completed:'s-completed', not_called:'s-not_called', failed:'s-failed',
@@ -1539,11 +1543,11 @@ async function load(){
           <div class="camp-bar" title="${pctPos}% positive"><div class="camp-bar-fill" style="width:${pctPos}%"></div></div>
           <span class="camp-bar-label">${pctPos}% positive</span>
           ${statusBadge}
-          ${c.consent_approved_at
-            ? `<span class="consent-ok">&#10003; Consent</span>`
-            : '<span class="consent-no">&#10007; No gate</span>'}
-          ${!c.consent_approved_at
-            ? `<button class="consent-approve-btn" onclick="approveCampaign(${c.id})">&#9654; Give Consent &amp; Call</button>`
+          ${(c.consent_approved_at && c.consent_basis === 'operator-attested-recipient-authorization')
+            ? `<span class="consent-ok">&#10003; Recipients attested</span>`
+            : '<span class="consent-no">&#10007; Not attested</span>'}
+          ${!(c.consent_approved_at && c.consent_basis === 'operator-attested-recipient-authorization')
+            ? `<button class="consent-approve-btn" onclick="approveCampaign(${c.id})">&#9654; Attest &amp; Call</button>`
             : ''}
         </div>
       </div>
@@ -1747,7 +1751,7 @@ async function startCalling(){
     const res = await fetch(`/api/campaign/${_wizCampaignId}/approve`, {
       method: 'POST',
       headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({language: _wizLanguage, region: 'IN'})
+      body: JSON.stringify({language: _wizLanguage, region: 'IN', recipients_authorized: true})
     });
     const data = await res.json();
     if(data.ok){
@@ -1981,11 +1985,13 @@ function callieToast(msg){
 }
 
 async function approveCampaign(campId){
+  // Explicit operator attestation; a public listing is not recipient authorization.
+  if(!confirm(ATTESTATION_TEXT + '\n\nPress OK only if this is true. Real calls will be placed.')) return;
   try{
     const res = await fetch(`/api/campaign/${campId}/approve`, {
       method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({})
+      body:JSON.stringify({recipients_authorized: true})
     });
     const j = await res.json();
     if(!res.ok || !j.ok){
@@ -2523,7 +2529,10 @@ def _run_pipeline_bg_inner(campaign_id: int, language: str, region: str):
                     )
                     conn.commit()
 
-                if outcome in ("no_answer", "unknown", "failed", "busy", "cancelled") and lead["osm_id"]:
+                # Only clean "nobody answered / line busy" outcomes are retried. unknown,
+                # failed and cancelled outcomes may already have reached the vendor, and
+                # ambiguous submissions come back as SKIPPED above — none are redialed.
+                if outcome in ("no_answer", "busy") and lead["osm_id"]:
                     schedule_retry(
                         lead_id=lead["id"], campaign_id=campaign_id,
                         product=product, attempt=0,
@@ -2535,7 +2544,7 @@ def _run_pipeline_bg_inner(campaign_id: int, language: str, region: str):
                 # reason has to be visible in the console during a live demo. The
                 # bookkeeping UPDATE is itself wrapped, because a failure there used to
                 # escape the loop and silently abort every remaining lead.
-                print(f"[Pipeline] Campaign #{campaign_id} lead {lead['id']} failed: {e}")
+                print(f"[Pipeline] Campaign #{campaign_id} lead {lead['id']} failed: {redact_phones(str(e))}")
                 _tb.print_exc()
                 try:
                     with get_conn() as conn:
@@ -2544,7 +2553,7 @@ def _run_pipeline_bg_inner(campaign_id: int, language: str, region: str):
                         # showing a bare red "failed" with nothing behind it.
                         conn.execute(
                             "UPDATE leads SET status='failed', skip_reason=? WHERE id=?",
-                            (f"call error: {e}"[:400], lead["id"])
+                            (f"call error: {redact_phones(str(e))}"[:400], lead["id"])
                         )
                         conn.commit()
                 except Exception as e2:
@@ -2751,7 +2760,7 @@ def api_campaign_start(campaign_id):
     init_db()
     with get_conn() as conn:
         row = conn.execute(
-            "SELECT consent_approved_at FROM campaigns WHERE id=?", (campaign_id,)
+            "SELECT consent_approved_at, consent_basis FROM campaigns WHERE id=?", (campaign_id,)
         ).fetchone()
         not_called = conn.execute(
             "SELECT COUNT(*) FROM leads WHERE campaign_id=? AND status='not_called'", (campaign_id,)
@@ -2763,6 +2772,12 @@ def api_campaign_start(campaign_id):
             "started": False,
             "message": f"Campaign #{campaign_id} has not been approved yet. "
                        f"Call POST /api/campaign/{campaign_id}/approve first."
+        }), 400
+    if row["consent_basis"] != ATTESTED_BASIS:
+        return jsonify({
+            "started": False,
+            "message": f"Campaign #{campaign_id} has no recipient-authorization attestation. "
+                       f"Approve it with the attestation checkbox before calling."
         }), 400
     if not_called == 0:
         # Don't answer "started" when the background thread will immediately find
@@ -2797,6 +2812,13 @@ def api_approve_campaign(camp_id):
     language = data.get("language") or "Hindi"
     region   = data.get("region") or "IN"
 
+    # A public directory listing or a business purpose is not recipient authorization.
+    # Live calls need the operator's explicit attestation, sent as a literal boolean
+    # true from the attestation checkbox/dialog — never inferred.
+    if data.get("recipients_authorized") is not True:
+        return jsonify({"ok": False, "message": "Not started — confirm the recipient-authorization "
+                                                "attestation first. " + ATTESTATION_TEXT}), 400
+
     init_db()
     with get_conn() as conn:
         row = conn.execute("SELECT id, consent_approved_at FROM campaigns WHERE id=?", (camp_id,)).fetchone()
@@ -2816,8 +2838,9 @@ def api_approve_campaign(camp_id):
                             "message": f"Campaign #{camp_id} has no uncalled leads — run discovery "
                                        f"again to add vendors before giving consent."}), 400
         conn.execute(
-            "UPDATE campaigns SET consent_approved_at=? WHERE id=? AND consent_approved_at IS NULL",
-            (datetime.now(timezone.utc).isoformat(), camp_id)
+            "UPDATE campaigns SET consent_approved_at=COALESCE(consent_approved_at, ?), "
+            "consent_basis=? WHERE id=?",
+            (datetime.now(timezone.utc).isoformat(), ATTESTED_BASIS, camp_id)
         )
         conn.commit()
 
@@ -3090,6 +3113,15 @@ def _callie_exec_tool(fn_name, fn_args, user_msg=""):
             if not_called == 0:
                 return {"error": f"Campaign #{camp_id} has no uncalled leads — nothing to dial. "
                                  f"Run discovery again to add vendors first."}, None
+            with get_conn() as conn:
+                basis = conn.execute("SELECT consent_basis FROM campaigns WHERE id=?",
+                                     (camp_id,)).fetchone()["consent_basis"]
+            if basis != ATTESTED_BASIS:
+                # The assistant can never attest recipient authorization on the
+                # operator's behalf; that is only recorded from the attestation UI.
+                return {"error": f"Not started — campaign #{camp_id} has no recipient-authorization "
+                                 f"attestation. Approve it in the Campaigns tab (or the wizard) "
+                                 f"with the attestation checkbox first."}, None
             if not _has_human_confirmation(user_msg):
                 # The model deciding on its own that "the user seems fine with it" is
                 # exactly how this tool used to place real calls with zero human

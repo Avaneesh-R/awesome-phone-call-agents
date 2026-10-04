@@ -9,6 +9,7 @@ import json
 import sys
 from datetime import datetime, timezone
 from models import init_db, get_conn, Lead, Campaign, _mask_phone
+from call_safety import ATTESTED_BASIS, ATTESTATION_TEXT, redact_phones
 from discovery import discover_vendors, _looks_spam
 from script_gen import generate_goal, prompt_client_approval
 from caller import (execute_call_pipeline, classify_round1, extract_round2_fields,
@@ -216,7 +217,8 @@ def run_campaign(product: str, location: str, limit: int,
                  export: str = None, skip_hours_gate: bool = False,
                  export_csv_path: str = None, export_json_path: str = None,
                  persona_name: str = None, persona_tone: str = "professional",
-                 template_goal: str = None, save_template_name: str = None):
+                 template_goal: str = None, save_template_name: str = None,
+                 attest_recipients: bool = False):
     init_db()
 
     print(f"\nVendor Discovery & Outreach")
@@ -238,19 +240,33 @@ def run_campaign(product: str, location: str, limit: int,
 
     if yes:
         print(f"\nAuto-confirming {len(vendors)} vendors (--yes flag).")
-        consent_approved_at = datetime.now(timezone.utc).isoformat()
     else:
         confirm = input(f"\nProceed with these {len(vendors)} vendors? [y/N]: ").strip().lower()
         if confirm != "y":
             print("Aborted.")
             sys.exit(0)
-        consent_approved_at = datetime.now(timezone.utc).isoformat()
+    consent_approved_at = datetime.now(timezone.utc).isoformat()
+
+    # Live calls additionally need the operator's explicit attestation that every
+    # recipient authorized the call. Being listed on OpenStreetMap, or having a
+    # business reason to call, is not authorization. --yes never implies it.
+    consent_basis = "dry-run-preview"
+    if not dry_run:
+        print(f"\n{ATTESTATION_TEXT}")
+        if attest_recipients:
+            print("Attestation given via --attest-recipient-authorization.")
+        else:
+            typed = input('Type "I ATTEST" to confirm, anything else to abort: ').strip()
+            if typed != "I ATTEST":
+                print("No attestation — aborting before any call is placed.")
+                sys.exit(0)
+        consent_basis = ATTESTED_BASIS
 
     with get_conn() as conn:
         campaign = Campaign(
             product_description=product,
             location=location,
-            consent_basis="client-reviewed-and-approved",
+            consent_basis=consent_basis,
             consent_approved_at=consent_approved_at,
         )
         campaign.save(conn)
@@ -354,7 +370,7 @@ def run_campaign(product: str, location: str, limit: int,
                     inference = infer_from_transcript(transcript_lines, product, round_num=1)
                     print(f"  Interest: {inference.get('interest_level','?')} | "
                           f"Rec R2: {inference.get('recommend_round2','?')} | "
-                          f"{inference.get('summary','')[:60]}")
+                          f"{redact_phones(str(inference.get('summary','')))[:60]}")
                 except Exception as ie:
                     print(f"  Inference error: {ie}")
 
@@ -397,7 +413,9 @@ def run_campaign(product: str, location: str, limit: int,
                                                   region=region, language=language)
                         except Exception:
                             pass
-            elif outcome in ("no_answer", "failed", "busy") and lead.osm_id and not dry_run:
+            # Only clean, definitive "nobody answered / line busy" outcomes are retried.
+            # failed / unknown / ambiguous outcomes may already have reached the vendor.
+            elif outcome in ("no_answer", "busy") and lead.osm_id and not dry_run:
                 from scheduler import schedule_retry
                 attempt = 0  # first retry
                 scheduled = schedule_retry(
@@ -413,13 +431,13 @@ def run_campaign(product: str, location: str, limit: int,
                 if scheduled:
                     print(f"  [Retry] Scheduled retry #1 for lead {lead.id}")
         except Exception as e:
-            print(f"  Error: {e}")
+            print(f"  Error: {redact_phones(str(e))}")
             with get_conn() as conn:
                 update_lead_status(conn, lead.id, "failed", None, round_num=1)
                 # Keep the reason with the lead — a bare "failed" badge with no
                 # explanation is the one outcome the dashboard cannot account for.
                 conn.execute("UPDATE leads SET skip_reason=? WHERE id=?",
-                             (f"call error: {e}"[:400], lead.id))
+                             (f"call error: {redact_phones(str(e))}"[:400], lead.id))
                 conn.commit()
 
     if not positives:
@@ -472,7 +490,7 @@ def run_campaign(product: str, location: str, limit: int,
                     inference = infer_from_transcript(transcript_lines, product, round_num=2)
                     print(f"  Can supply: {inference.get('can_supply','?')} | "
                           f"Price: {inference.get('price_range','?')} | "
-                          f"{inference.get('summary','')[:60]}")
+                          f"{redact_phones(str(inference.get('summary','')))[:60]}")
                 except Exception as ie:
                     print(f"  Inference error: {ie}")
 
@@ -481,7 +499,7 @@ def run_campaign(product: str, location: str, limit: int,
                 update_lead_status(conn, lead.id, "completed", call_id, round_num=2)
                 log_call(conn, lead.id, call_id, 2, status_output, combined or None)
         except Exception as e:
-            print(f"  Error: {e}")
+            print(f"  Error: {redact_phones(str(e))}")
 
     with get_conn() as conn:
         print_results_table(conn, campaign_id)
@@ -516,7 +534,12 @@ def main():
     parser.add_argument("--dry-run", action="store_true",
                         help="Plan calls but do not execute them. This is the default behavior "
                              "regardless of this flag — kept for backwards compatibility.")
-    parser.add_argument("--yes", "-y", action="store_true", help="Skip all confirmation prompts")
+    parser.add_argument("--yes", "-y", action="store_true",
+                        help="Skip the vendor-list confirmation prompt. Does NOT attest "
+                             "recipient authorization for live calls.")
+    parser.add_argument("--attest-recipient-authorization", action="store_true",
+                        help="With --live: attest non-interactively that every recipient has "
+                             "authorized you to call them. A public listing is not authorization.")
     parser.add_argument("--export-excel", metavar="FILE.xlsx", default=None,
                         help="Export results to Excel after campaign completes")
     parser.add_argument("--export-csv", metavar="FILE.csv", default=None,
@@ -545,6 +568,11 @@ def main():
 
     if not args.product or not args.location:
         parser.error("--product and --location are required (unless using --cancel-campaign)")
+    if args.live and not args.region:
+        parser.error("--live requires --region (e.g. IN, US) so every destination can be "
+                     "validated as E.164 for that region")
+    if args.attest_recipient_authorization and not args.live:
+        parser.error("--attest-recipient-authorization only applies with --live")
 
     template_goal = None
     region = args.region
@@ -586,6 +614,7 @@ def main():
         persona_tone=persona_tone,
         template_goal=template_goal,
         save_template_name=args.save_template,
+        attest_recipients=args.attest_recipient_authorization,
     )
 
 
